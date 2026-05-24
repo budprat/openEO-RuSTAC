@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package orbit.etl.v1;
+
+// EtlService — submit and observe ETL pipelines.
+service EtlService {
+  // Run a pipeline; streams events as work progresses.
+  rpc RunPipeline(PipelineSpec) returns (stream PipelineEvent);
+
+  // Get the latest status for a job.
+  rpc GetStatus(JobId) returns (JobStatus);
+
+  // List all known jobs (most recent first).
+  rpc ListJobs(ListJobsRequest) returns (JobList);
+
+  // Cancel an in-flight job.
+  rpc CancelJob(JobId) returns (CancelResponse);
+}
+
+// ────────────────────────── request / response ──────────────────────────
+
+message PipelineSpec {
+  // Input source.
+  oneof source {
+    FileSource file = 1;
+    // Reserved for future: KafkaSource, NatsSource, ObjectStoreSource, …
+  }
+
+  // Destination table name in SQLite.
+  string destination_table = 10;
+
+  // Optional Polars SQL transform to apply between source and sink.
+  // Example: "SELECT user_id, ts, amount FROM input WHERE country = 'US'"
+  // If empty, no transformation is applied.
+  string sql_transform = 11;
+
+  // Optional dedupe column. If set, rows with duplicate values in this column
+  // are not inserted on conflict (uses SQLite ON CONFLICT DO NOTHING).
+  string dedupe_column = 12;
+
+  // Batch size for streamed inserts (default: 1024).
+  uint32 batch_size = 13;
+}
+
+message FileSource {
+  string path = 1;
+  FileFormat format = 2;
+  // CSV-specific options (ignored for other formats).
+  bool has_header = 10;
+  string delimiter = 11;
+}
+
+enum FileFormat {
+  FILE_FORMAT_UNSPECIFIED = 0;
+  FILE_FORMAT_CSV = 1;
+  FILE_FORMAT_PARQUET = 2;
+  FILE_FORMAT_JSON = 3;
+}
+
+message JobId { string id = 1; }
+
+message JobStatus {
+  string id = 1;
+  JobState state = 2;
+  uint64 rows_read = 3;
+  uint64 rows_written = 4;
+  string started_at = 5;            // RFC3339
+  string finished_at = 6;           // RFC3339, empty if running
+  string error = 7;                 // populated if state == FAILED
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_PENDING = 1;
+  JOB_STATE_RUNNING = 2;
+  JOB_STATE_COMPLETED = 3;
+  JOB_STATE_FAILED = 4;
+  JOB_STATE_CANCELLED = 5;
+}
+
+message ListJobsRequest {
+  uint32 limit = 1;                 // default 50
+}
+
+message JobList {
+  repeated JobStatus jobs = 1;
+}
+
+message PipelineEvent {
+  oneof event {
+    JobStarted started = 1;
+    JobProgress progress = 2;
+    JobCompleted completed = 3;
+    JobFailed failed = 4;
+  }
+}
+
+message JobStarted { string job_id = 1; }
+message JobProgress {
+  string job_id = 1;
+  uint64 rows_read = 2;
+  uint64 rows_written = 3;
+}
+message JobCompleted {
+  string job_id = 1;
+  uint64 rows_read = 2;
+  uint64 rows_written = 3;
+}
+message JobFailed {
+  string job_id = 1;
+  string error = 2;
+}
+
+message CancelResponse {
+  bool cancelled = 1;
+}

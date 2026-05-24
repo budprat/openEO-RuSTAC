@@ -1,0 +1,75 @@
+# cargo-deny configuration for orbit-rs.
+#
+# Policy goals (per docs/clean-room-protocol.md):
+#   - Direct dependencies must be permissively licensed (MIT, Apache-2.0,
+#     BSD, ISC, Unicode-DFS-2016, Zlib).
+#   - No LGPL/GPL/AGPL anywhere — we are MIT/Apache, not derivative of
+#     the upstream raster engine workspace.
+#   - Known RUSTSEC advisories are tracked, not silenced.
+#   - One version of each crate where practical.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+# ─────────────────────────────────────────────────────────────────────────
+# Security advisories
+# ─────────────────────────────────────────────────────────────────────────
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "warn"
+ignore = [
+    # serde_yaml 0.9.34+deprecated — known transitive dep; remediation
+    # tracked in docs/plans/01-maturity-and-parity.md (Axis A).
+    "RUSTSEC-2024-0320",
+    # jsonschema 0.30 transitive (regex / referencing) — review on each
+    # `cargo update`; the crate is pinned in apps/orbit-openeo/Cargo.toml.
+]
+
+# ─────────────────────────────────────────────────────────────────────────
+# Licence policy
+# ─────────────────────────────────────────────────────────────────────────
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",   # file-level copyleft, OK for libraries
+    "MIT-0",
+    "BSL-1.0",
+    "OpenSSL",
+]
+# Deny anything copyleft that would taint our MIT/Apache distribution.
+# Note: LGPL is *not* in the allow list, by design. If a transitive dep
+# pulls in LGPL we must investigate before merging.
+confidence-threshold = 0.8
+
+# ─────────────────────────────────────────────────────────────────────────
+# Crate bans
+# ─────────────────────────────────────────────────────────────────────────
+[bans]
+multiple-versions = "warn"   # informational; the polars stack pulls in a few
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Source registry
+# ─────────────────────────────────────────────────────────────────────────
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

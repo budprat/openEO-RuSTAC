@@ -1,0 +1,17 @@
+{
+  "process": {
+    "process_graph": {
+      "addNode":      { "process_id": "add",      "arguments": { "x": 10, "y": 5 } },
+      "multiplyNode": { "process_id": "multiply", "arguments": { "x": { "from_node": "addNode" }, "y": 3 } },
+      "subtractNode": { "process_id": "subtract", "arguments": { "x": { "from_node": "multiplyNode" }, "y": 7 } },
+      "divideNode":   { "process_id": "divide",   "arguments": { "x": { "from_node": "subtractNode" }, "y": 4 } },
+      "save": {
+        "process_id": "save_result",
+        "arguments": { "data": { "from_node": "divideNode" }, "format": "JSON" },
+        "result": true
+      }
+    }
+  },
+  "title": "Arithmetic chain: ((10 + 5) × 3 − 7) ÷ 4 = 9.5",
+  "description": "Exercises add, subtract, multiply, divide, save_result(JSON). Tests topological order resolution and from_node chaining."
+}

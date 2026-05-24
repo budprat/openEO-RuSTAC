@@ -1,0 +1,255 @@
+[package]
+name         = "orbit-geo"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = "MIT OR Apache-2.0"
+description  = "Block-parallel raster processing kernel for orbit-rs (Earth Observation, satellite imagery, STAC pipelines)"
+
+# orbit-geo intentionally mirrors the *public-API shape* of an upstream
+# raster engine workspace (LGPL-3.0) so that users can swap engines later if
+# desired. The implementation is clean-room: written from observation of the
+# public surface only, with permissively-licensed (MIT/Apache-2.0) code.
+# Upstream attribution is in NOTICE.md and README.md.
+
+[features]
+default = []
+# Build with `gdal-src` to compile libgdal from source for fully-static binaries.
+static-gdal = ["gdal-src"]
+# STAC catalog client integration (rustac stack). Pulls in:
+#   stac           — core types (Item, Collection, Catalog)
+#   stac-io        — read/write incl. stac-geoparquet
+#   stac-extensions — eo / sar / proj / sentinel-2 typed extensions
+#   stac-api       — Search wire types
+#   stac-client    — async client for STAC APIs
+#   stac-validate  — JSON Schema validation
+stac           = ["dep:stac", "dep:stac-io", "dep:stac-extensions", "dep:stac-api", "dep:stac-client", "dep:stac-validate", "dep:reqwest", "dep:url"]
+# Offline catalog queries against stac-geoparquet. NOTE: currently shells out
+# to the `rustac` CLI because `stac-duckdb 0.3.7` pulls in `stac 0.16` which
+# conflicts with our `stac 0.17` pin. Will switch to a direct `stac_duckdb`
+# binding once that crate publishes a 0.17-compatible release.
+stac-duckdb    = ["stac"]
+# Async TIFF reader path (cloud-native, no libgdal dependency on read).
+async-tiff  = ["dep:async-tiff", "dep:object_store"]
+# Compile-time logging integration.
+tracing     = []
+# openEO backend client — consume openEO backends (VITO, CDSE, EODC, ...) as a DataSource.
+# No Rust crate exists for openEO (May 2026) so we ship a minimal client here.
+openeo      = ["dep:reqwest", "dep:url"]
+# Heavy-dep features for Tier 3.
+use_polars  = []  # Tier 3.3 — reserved for zonal_stats DataFrame output.
+use_ml      = []  # Tier 3.6 — pure-Rust logistic regression classifier in ml.rs.
+                  # (LightGBM bindings deferred — lightgbm-sys 0.3 broken against CMake 4.x on macOS.)
+use_opencv  = []  # Tier 3 filters submodule (morphological ops on masks).
+cloud_mask  = []  # Tier 3.5 — rule-based cloud detection (always on, no extra deps).
+# Live-network smoke tests (Tier 0 T0.3). Default-off so `cargo test` is hermetic.
+bench_live  = ["dep:reqwest", "dep:url"]
+
+[dependencies]
+# Workspace-shared
+orbit-core         = { workspace = true }
+eo-core            = { workspace = true }
+eo-io              = { workspace = true, features = ["gdal"] }
+tokio              = { workspace = true, features = ["rt-multi-thread"] }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+ndarray            = "0.17"   # must match gdal 0.19's internal ndarray version
+rayon              = "1"
+futures            = "0.3"
+
+# Raster I/O
+gdal               = { version = "0.19", features = ["ndarray"] }
+gdal-src           = { version = "0.3", optional = true }
+async-tiff         = { version = "0.3", features = ["ndarray"], optional = true }
+object_store       = { version = "0.13", features = ["aws", "gcp", "azure", "http"], optional = true }
+
+# STAC (optional — gated by the `stac` / `stac-duckdb` features).
+# Versions verified against crates.io 2026-05-21.
+stac               = { version = "0.17", optional = true }
+stac-io            = { version = "0.2", optional = true }
+stac-extensions    = { version = "0.1", optional = true }
+stac-api           = { version = "0.8", optional = true }
+stac-client        = { version = "0.3", optional = true }
+stac-validate      = { version = "0.6", optional = true }
+# stac-duckdb: NOT depended on directly — see `stac-duckdb` feature note above.
+# stac-duckdb        = { version = "0.3", optional = true }
+
+# openEO client (gated by `openeo` feature) — small, focused on /jobs and result download
+# Single workspace pin so orbit-geo + orbit-openeo share one reqwest tree (A15a).
+reqwest            = { workspace = true, optional = true }
+sha2               = "0.10"  # used by both stac/openeo features AND cache module
+# `hex` is no longer optional — cache module uses it for digest encoding (M3).
+hex                = { workspace = true }
+url                = { version = "2", optional = true }
+
+# Misc
+num-traits         = "0.2"
+parking_lot        = { workspace = true }
+tempfile           = "3"  # COG variants (T1.2) need intermediate GeoTIFF path
+# Heavy-dep crates (polars / lightgbm / opencv) are added during their
+# respective Tier 3 tasks with verified versions, not preemptively.
+
+[dev-dependencies]
+tempfile           = "3"
+tokio              = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion          = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+ndarray = "0.17"
+anyhow = "1"
+serde_json = "1"
+
+[[bench]]
+name    = "apply_reduction"
+harness = false
+
+[[bench]]
+name    = "bench_apply"
+harness = false
+
+[[bench]]
+name    = "bench_apply_with_mask"
+harness = false
+
+[[bench]]
+name    = "bench_ndvi_annual_full_tile"
+harness = false
+
+[[bench]]
+name              = "bench_get_vs_get_remote"
+harness           = false
+required-features = ["bench_live"]
+
+
+[[example]]
+name = "ndvi_mean"
+required-features = []
+
+
+# Tier 4.6 — 30 examples mirroring the upstream raster engine API
+[[example]]
+name = "01_create_raster_dataset_simple"
+required-features = []
+
+[[example]]
+name = "02_builder_methods"
+required-features = []
+
+[[example]]
+name = "03_process_image"
+required-features = []
+
+[[example]]
+name = "04_compute_ndvi_synthetic"
+required-features = []
+
+[[example]]
+name = "05_apply_reduction_mean_over_time"
+required-features = []
+
+[[example]]
+name = "06_apply_reduction_with_mask"
+required-features = []
+
+[[example]]
+name = "07_apply_with_mask"
+required-features = []
+
+[[example]]
+name = "08_apply_reduction_row_pixel"
+required-features = []
+
+[[example]]
+name = "09_read_block_layer_idx"
+required-features = []
+
+[[example]]
+name = "10_extend_datasets"
+required-features = []
+
+[[example]]
+name = "11_stack_datasets"
+required-features = []
+
+[[example]]
+name = "12_sample_points"
+required-features = []
+
+[[example]]
+name = "13_zonal_histogram"
+required-features = []
+
+[[example]]
+name = "14_mosaic_via_gdal_utils"
+required-features = []
+
+[[example]]
+name = "15_warp_to_epsg"
+required-features = []
+
+[[example]]
+name = "16_rasterize_polygon"
+required-features = []
+
+[[example]]
+name = "17_convert_to_cog"
+required-features = []
+
+[[example]]
+name = "18_write_window3_direct"
+required-features = []
+
+[[example]]
+name = "19_image_query_builder"
+required-features = []
+
+[[example]]
+name = "20_canonical_bands_lookup"
+required-features = []
+
+[[example]]
+name = "21_collection_id_per_provider"
+required-features = []
+
+[[example]]
+name = "22_intersects_variants"
+required-features = []
+
+[[example]]
+name = "23_vsi_rewrite_paths"
+required-features = []
+
+[[example]]
+name = "24_cmp_serializes_to_stac"
+required-features = []
+
+[[example]]
+name = "25_layer_mappings_for_scenes"
+required-features = []
+
+[[example]]
+name = "26_configure_anonymous_s3"
+required-features = []
+
+[[example]]
+name = "27_planetary_computer_signing_endpoint"
+required-features = []
+
+[[example]]
+name = "28_apply_cog_output"
+required-features = []
+
+[[example]]
+name = "29_data_source_builder"
+required-features = []
+
+[[example]]
+name = "30_provider_constants"
+required-features = []
+
+# Phase A microbench — subprocess gdal_translate vs in-process gdal::Dataset
+# on a single Sentinel-2 COG (live network).
+[[example]]
+name = "bench_download_one_cog"
+required-features = []

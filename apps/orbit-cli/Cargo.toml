@@ -1,0 +1,28 @@
+[package]
+name         = "orbit-cli"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+
+[[bin]]
+name = "orbit"
+path = "src/main.rs"
+
+[dependencies]
+orbit-proto        = { workspace = true }
+orbit-geo          = { path = "../../crates/orbit-geo" }
+tokio              = { workspace = true, features = ["full"] }
+tokio-stream       = { workspace = true }
+futures            = { workspace = true }
+tonic              = { workspace = true }
+anyhow             = { workspace = true }
+clap               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+indicatif          = { workspace = true }
+
+[dev-dependencies]
+assert_cmd         = "2"
+tempfile           = "3"
+gdal               = { version = "0.19", features = ["ndarray"] }

@@ -1,0 +1,30 @@
+[package]
+name         = "eo-io"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+description  = "I/O primitives for Earth-observation pipelines: atomic filesystem writes, GDAL-bound RasterType trait, VSI path helpers. The home for everything that touches the disk or libgdal."
+
+[lints]
+workspace = true
+
+[features]
+# Default: only the pure-fs helpers compile. Enables `eo-io` to be built in
+# CI on hosts without libgdal.
+default = []
+# Enables the GDAL-bound items (the `RasterType` trait). Adds the `gdal`
+# crate dep with `ndarray` feature.
+gdal = ["dep:gdal"]
+
+[dependencies]
+eo-core      = { workspace = true }
+serde        = { workspace = true }
+thiserror    = { workspace = true }
+num-traits   = "0.2"
+gdal         = { version = "0.19", features = ["ndarray"], optional = true }
+
+[dev-dependencies]
+tempfile     = "3"

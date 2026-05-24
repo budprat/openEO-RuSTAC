@@ -1,0 +1,103 @@
+[package]
+name         = "orbit-openeo"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+description  = "openEO API 1.3.0 façade for orbit-rs. Axum-based HTTP server, hand-written routes, runtime JSON-Schema validation against the shipped openapi.json."
+
+[features]
+# `geo-kernel` (default) wires the orbit-geo / GDAL-backed `GeoExecutor`
+# for real raster processing. Disable to build a slim arithmetic-only
+# server that doesn't require libgdal on the host.
+default     = ["geo-kernel"]
+geo-kernel  = ["dep:orbit-geo", "dep:ndarray", "dep:gdal", "orbit-geo/stac"]
+# Pure-Rust async S3 + async-tiff downloader (P2) -- additive; pulls the
+# async-tiff feature stack via orbit-geo. Requires geo-kernel for the GDAL
+# write-side codepath.
+async-tiff-downloader = ["geo-kernel", "orbit-geo/async-tiff"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal — the orbit-rs platform crates this app composes.
+orbit-observability  = { workspace = true }
+orbit-resilience     = { workspace = true }
+eo-process           = { workspace = true }
+eo-mask              = { workspace = true }
+eo-vector            = { workspace = true }
+orbit-etl            = { workspace = true }
+# orbit-cache, orbit-config: removed — were never `use`d.
+# `orbit-cache` is redundant with `orbit_geo::cache::FileCache`; layered
+# config can return as a future atom (would replace clap with figment).
+
+# HTTP layer.
+axum                 = { version = "0.8", features = ["macros", "ws"] }
+tower                = "0.5"
+tower-http           = { version = "0.6", features = ["trace", "limit", "timeout"] }
+
+# Runtime / async.
+tokio                = { workspace = true, features = ["full"] }
+tokio-stream         = { workspace = true }
+futures              = { workspace = true }
+async-trait          = { workspace = true }
+
+# Serialization / spec.
+serde                = { workspace = true }
+serde_json           = { workspace = true }
+serde_yaml           = { workspace = true }
+jsonschema           = { version = "0.30", default-features = false }
+
+# Pluggable object storage for /files — local disk + cloud backends.
+object_store         = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+bytes                = "1"
+
+# HTTP STAC client for /collections — single workspace pin (A15a).
+reqwest              = { workspace = true }
+url                  = "2"
+
+# Graph algorithms — process-graph topological walk, cycle detection.
+petgraph             = { workspace = true }
+
+# Pure-Rust TIFF writer for GeoExecutor's `save_result` arm.
+tiff                 = "0.10"
+
+# P0-1: CSPRNG for bearer tokens + device codes (audit fix).
+rand                 = "0.9"
+base64               = "0.22"
+subtle               = "2"
+
+# Real block-parallel raster kernel: STAC → cropped COG download → block-parallel reduction → GeoTIFF.
+# Gated behind `geo-kernel` cargo feature so callers without libgdal can opt out.
+orbit-geo            = { workspace = true, optional = true, features = ["cloud_mask", "use_ml"] }
+ndarray              = { version = "0.17", optional = true }   # must match orbit-geo / gdal-0.19's internal ndarray
+gdal                 = { version = "0.19", optional = true }    # geo-kernel only — for direct raster reads
+
+# Persistent job store backed by SQLite via sqlx.
+sqlx                 = { workspace = true }
+
+# Errors / logging.
+thiserror            = { workspace = true }
+anyhow               = { workspace = true }
+tracing              = { workspace = true }
+tracing-subscriber   = { workspace = true }
+
+# Misc.
+clap                 = { workspace = true }
+once_cell            = { workspace = true }
+
+[dev-dependencies]
+tokio                = { workspace = true, features = ["full", "test-util"] }
+tower                = { version = "0.5", features = ["util"] }
+http-body-util       = "0.1"
+wiremock             = "0.6"
+orbit-core           = { workspace = true }
+uuid                 = { workspace = true }
+# `gdal` is used only by geo_executor tests behind cfg(feature="geo-kernel");
+# kept as an unconditional dev-dep since dev-deps don't propagate to
+# library consumers.
+gdal                 = "0.19"
+async-trait          = { workspace = true }

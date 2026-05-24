@@ -1,0 +1,21 @@
+[package]
+name         = "orbit-observability"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+description  = "Tracing + Prometheus metric registry + optional OTLP exporter. All metric/log surface for the orbit-rs platform lives here."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+otlp = []  # reserved for opentelemetry-otlp wiring in a later session.
+
+[dependencies]
+serde       = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }

@@ -1,0 +1,30 @@
+use orbit_geo::gdal_utils::warp;
+
+fn tiny_gtiff(rows: usize, cols: usize, fill: i16) -> tempfile::TempPath {
+    use gdal::raster::{Buffer, RasterCreationOptions};
+    use gdal::spatial_ref::SpatialRef;
+    use gdal::DriverManager;
+    let tmp = tempfile::Builder::new().suffix(".tif").tempfile().unwrap();
+    let p = tmp.into_temp_path();
+    std::fs::remove_file(&p).ok();
+    let drv = DriverManager::get_driver_by_name("GTiff").unwrap();
+    let opts = RasterCreationOptions::from_iter(["TILED=NO"]);
+    let mut ds = drv.create_with_band_type_with_options::<i16, _>(&p, cols, rows, 1, &opts).unwrap();
+    ds.set_geo_transform(&[0.0, 1.0, 0.0, rows as f64, 0.0, -1.0]).unwrap();
+    ds.set_spatial_ref(&SpatialRef::from_epsg(4326).unwrap()).unwrap();
+    let mut band = ds.rasterband(1).unwrap();
+    let data: Vec<i16> = vec![fill; rows * cols];
+    let mut buf = Buffer::new((cols, rows), data);
+    band.write::<i16>((0, 0), (cols, rows), &mut buf).unwrap();
+    drop(band); drop(ds);
+    p
+}
+
+fn main() -> anyhow::Result<()> {
+    let src = tiny_gtiff(4, 4, 42);
+    let dst = tempfile::Builder::new().suffix(".tif").tempfile()?.into_temp_path();
+    std::fs::remove_file(&dst).ok();
+    warp(&src, &dst, 3577)?;
+    println!("Example 15: warped to EPSG:3577 → {}", dst.display());
+    Ok(())
+}

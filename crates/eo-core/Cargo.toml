@@ -1,0 +1,19 @@
+[package]
+name         = "eo-core"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+description  = "Pure data types for Earth-observation pipelines: shapes, windows, geo-transforms, output configuration. Zero I/O, zero GDAL — usable from any layer."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+num-traits  = "0.2"
+
+[dev-dependencies]
+serde_json  = { workspace = true }

@@ -1,0 +1,21 @@
+[package]
+name         = "orbit-resilience"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+description  = "Retry policy + timeout + concurrency-limit + circuit-breaker primitives, designed to compose with tower middleware stacks."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+thiserror   = { workspace = true }
+tokio       = { workspace = true, features = ["full"] }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+tokio       = { workspace = true, features = ["full", "test-util"] }

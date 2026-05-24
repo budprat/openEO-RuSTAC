@@ -1,0 +1,22 @@
+[package]
+name         = "orbit-config"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+description  = "Typed 12-factor configuration: orbit.toml with env overrides. Layered loader replaces the current ad-hoc env-var sprawl."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde       = { workspace = true }
+thiserror   = { workspace = true }
+figment     = { version = "0.10", features = ["toml", "env"] }
+humantime-serde = "1"
+
+[dev-dependencies]
+serde_json  = { workspace = true }
+tempfile    = "3"

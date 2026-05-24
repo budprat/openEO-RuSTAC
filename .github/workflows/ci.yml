@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # Matrix: cargo check on macOS + Ubuntu, stable + nightly
+  # ────────────────────────────────────────────────────────────────────────
+  check:
+    name: cargo check (${{ matrix.os }} / ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        toolchain: [stable, beta, "1.85.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system GDAL + cmake + protobuf (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev cmake protobuf-compiler
+      - name: Install system GDAL + cmake + protobuf (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install gdal cmake protobuf
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true   # clippy warnings allowed for now; flip later
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Test suite (default features) on macOS + Ubuntu
+  # ────────────────────────────────────────────────────────────────────────
+  test:
+    name: cargo test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system GDAL + cmake + protobuf (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev cmake protobuf-compiler
+      - name: Install system GDAL + cmake + protobuf (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install gdal cmake protobuf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --no-default-features
+      - run: cargo test -p orbit-geo --features cloud_mask
+      - run: cargo test -p orbit-geo --features use_ml
+      - run: cargo test -p orbit-geo --features async-tiff
+      - run: cargo test -p orbit-cli --test cli_geo
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Docs (orbit-geo)
+  # ────────────────────────────────────────────────────────────────────────
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GDAL + cmake + protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev cmake protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc -p orbit-geo --no-deps
+        continue-on-error: true   # missing_docs allowed for now
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Format
+  # ────────────────────────────────────────────────────────────────────────
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+        continue-on-error: true
+
+  # ────────────────────────────────────────────────────────────────────────
+  # eo-core (no GDAL) — fast smoke test of the pure-data crate.
+  # No system deps. Keeps eo-core honest about its zero-I/O policy.
+  # ────────────────────────────────────────────────────────────────────────
+  eo-core-bare:
+    name: eo-core (no system deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p eo-core --lib
+
+  # eo-io has two compile modes:
+  #   default (no GDAL) — atomic + vsi modules only; no system deps needed.
+  #   --features gdal   — adds the RasterType trait; requires libgdal-dev.
+  # We test the bare path here in a fast no-system-deps job; the gdal path
+  # is exercised by the `test` matrix above via orbit-geo which enables it.
+  eo-io-bare:
+    name: eo-io (no GDAL feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p eo-io --lib --no-default-features
+
+  # Scaffold crates: all the no-system-deps crates in one batch.
+  # Each was created during Week 1-8 with a stable public API and inline
+  # tests; this job catches accidental dep bloat (any of them picking up
+  # libgdal/libsqlite/etc).
+  # openEO spec sanity: assert both forms of the openAPI 1.3.0 file we ship
+  # parse cleanly. Catches malformed edits to apps/orbit-openeo/spec/.
+  openapi-spec:
+    name: openEO spec parses (yaml + json)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p orbit-openeo --lib schema:: --lib
+
+  scaffold-crates:
+    name: scaffold crates (no system deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo test -p eo-kernel --lib
+          cargo test -p eo-catalog --lib
+          cargo test -p eo-mask --lib
+          cargo test -p eo-vector --lib
+          cargo test -p eo-process --lib
+          cargo test -p orbit-cache --lib
+          cargo test -p orbit-resilience --lib
+          cargo test -p orbit-observability --lib
+          cargo test -p orbit-config --lib
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Security advisories — `cargo audit`
+  # ────────────────────────────────────────────────────────────────────────
+  audit:
+    name: cargo audit (RUSTSEC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked cargo-audit
+      - run: cargo audit
+        continue-on-error: true   # known unmaintained deps tracked in plan
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Licence + dependency policy — `cargo deny`
+  # ────────────────────────────────────────────────────────────────────────
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked cargo-deny
+      - run: cargo deny check
+        continue-on-error: true   # warnings allowed during stabilisation
+
+  # ────────────────────────────────────────────────────────────────────────
+  # api-diff — self-test + workspace parity smoke. All shell inputs are
+  # hardcoded paths from the checkout; no untrusted external input is used.
+  # ────────────────────────────────────────────────────────────────────────
+  api-diff:
+    name: api-diff (self-test + parity smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test api-diff
+        working-directory: tools/api-diff
+        run: |
+          cargo test
+          cargo build --release
+      - name: Self-diff sanity check
+        working-directory: tools/api-diff
+        run: |
+          ./target/release/api-diff \
+            --left ../../crates \
+            --right ../../crates \
+            --out /tmp/self-diff.csv
+          gaps=$(awk -F, 'NR>1 && ($4!="true" || $5!="true") {c++} END {print c+0}' /tmp/self-diff.csv)
+          if [ "$gaps" != "0" ]; then
+            echo "Self-diff produced $gaps non-equal rows — diff tool is broken."
+            exit 1
+          fi
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Bench compile-only smoke. Full criterion runs are nightly, not per-PR.
+  # ────────────────────────────────────────────────────────────────────────
+  bench-build:
+    name: criterion bench compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GDAL + cmake + protobuf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgdal-dev cmake protobuf-compiler
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --no-run

@@ -1,0 +1,25 @@
+[package]
+name         = "eo-kernel"
+version      = { workspace = true }
+edition      = { workspace = true }
+rust-version = { workspace = true }
+license      = { workspace = true }
+authors      = { workspace = true }
+repository   = { workspace = true }
+description  = "Block-parallel raster kernels: apply / reduce traits, masked variants, rayon orchestration. The pure-compute core, no I/O."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+
+[dependencies]
+eo-core     = { workspace = true }
+serde       = { workspace = true }
+thiserror   = { workspace = true }
+rayon       = "1"
+num-traits  = "0.2"
+
+[dev-dependencies]
+serde_json  = { workspace = true }

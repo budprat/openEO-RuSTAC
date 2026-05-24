@@ -1,0 +1,138 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/orbit-core",
+    "crates/orbit-proto",
+    "crates/orbit-etl",
+    "crates/orbit-geo",
+    "crates/eo-core",
+    "crates/eo-io",
+    "crates/eo-kernel",
+    "crates/eo-catalog",
+    "crates/eo-mask",
+    "crates/eo-vector",
+    "crates/eo-process",
+    "crates/orbit-cache",
+    "crates/orbit-resilience",
+    "crates/orbit-observability",
+    "crates/orbit-config",
+    "apps/orbit-server",
+    "apps/orbit-cli",
+    "apps/orbit-openeo",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT OR Apache-2.0"
+authors      = ["NU"]
+description  = "orbit — multi-domain Rust platform (ETL · LLM agent · satellite/geo)"
+repository   = "https://github.com/NU/orbit-rs"
+
+[workspace.dependencies]
+# async
+tokio              = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio-stream       = "0.1"
+futures            = "0.3"
+async-trait        = "0.1"
+
+# grpc / proto
+tonic              = "0.14"
+tonic-build        = "0.14"
+tonic-prost-build  = "0.14"
+prost              = "0.14"
+prost-types        = "0.14"
+tonic-prost        = "0.14"
+
+# data
+polars             = { version = "0.53", features = ["lazy", "csv", "parquet", "json", "sql", "dtype-categorical", "dtype-date", "dtype-datetime"] }
+sqlx               = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros", "migrate", "uuid", "time", "json"] }
+
+# serialization
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+serde_yaml         = "0.9"
+
+# errors / logging
+thiserror          = "2"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# graph algorithms (process-graph topological walk, cycle detection)
+petgraph           = "0.8"
+
+# misc
+clap               = { version = "4", features = ["derive", "env"] }
+uuid               = { version = "1", features = ["v4", "serde"] }
+time               = { version = "0.3", features = ["serde", "macros", "formatting"] }
+indicatif          = "0.17"
+dashmap            = "6"
+once_cell          = "1"
+parking_lot        = "0.12"
+hex                = "0.4"
+
+# http client — single workspace pin so orbit-openeo + orbit-geo share one
+# reqwest/hyper/rustls tree (A15a). 0.13 uses `rustls` (was `rustls-tls` in 0.12).
+reqwest            = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip"] }
+
+# internal
+orbit-core         = { path = "crates/orbit-core" }
+orbit-proto        = { path = "crates/orbit-proto" }
+orbit-etl          = { path = "crates/orbit-etl" }
+eo-core              = { path = "crates/eo-core" }
+eo-io                = { path = "crates/eo-io" }
+eo-kernel            = { path = "crates/eo-kernel" }
+eo-catalog           = { path = "crates/eo-catalog" }
+eo-mask              = { path = "crates/eo-mask" }
+eo-vector            = { path = "crates/eo-vector" }
+eo-process           = { path = "crates/eo-process" }
+orbit-cache          = { path = "crates/orbit-cache" }
+orbit-resilience     = { path = "crates/orbit-resilience" }
+orbit-observability  = { path = "crates/orbit-observability" }
+orbit-config         = { path = "crates/orbit-config" }
+orbit-geo            = { path = "crates/orbit-geo" }
+
+# Phase 4 (orbit-geo) — STAC + raster stack. Uncomment when the crate lands.
+# See ../../13-geo-satellite/02-stac-sentinel2-2026.md for details.
+# stac              = "0.17"        # core STAC types, async built-in
+# stac-io           = "0.5"         # I/O + stac-geoparquet
+# stac-extensions   = "0.5"         # eo/sar/proj/sentinel-2 extensions
+# stac-api          = "0.8"         # STAC API spec types
+# stac-client       = "0.4"         # async STAC API client
+# stac-validate     = "0.4"         # JSON Schema validation
+# stac-duckdb       = "0.5"         # offline GeoParquet catalog queries
+# stac-server       = "0.5"         # Phase 6: serve STAC API from orbit-server
+# gdal              = "0.19"        # raster I/O + warp + reproject (needs libgdal ≥ 3.6)
+# gdal-src          = "0.3"         # optional: static-linked GDAL (upstream production pattern)
+# async-tiff        = { version = "0.3", features = ["ndarray"] }   # cloud-native async TIFF
+# proj4rs           = "0.2"         # pure-Rust projections
+# proj              = "0.27"        # libproj wrapper (fallback)
+# zarrs             = { version = "0.23", features = ["object_store", "zstd", "blosc"] }
+# zarrs_icechunk    = "0.5"         # transactional Zarr storage
+# object_store      = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
+# geoarrow-array    = "0.5"         # GeoArrow vector arrays
+# geoparquet        = "0.5"         # GeoParquet 1.1
+# cog3pio           = { git = "https://github.com/weiji14/cog3pio", rev = "<pin-when-stable>" }
+
+[workspace.lints.rust]
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "warn"
+dbg_macro = "deny"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+
+[profile.release]
+lto           = "thin"
+codegen-units = 1
+strip         = "debuginfo"
+opt-level     = 3
+
+[profile.dev]
+opt-level = 1

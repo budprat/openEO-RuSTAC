@@ -1,0 +1,15 @@
+/target
+**/target/
+/data
+/.sqlx
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.log
