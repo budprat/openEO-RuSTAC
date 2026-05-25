@@ -1,0 +1,312 @@
+{
+  "process": {
+    "process_graph": {
+      "load1": {
+        "process_id": "load_collection",
+        "arguments": {
+          "id": "sentinel-2-l2a",
+          "spatial_extent": {
+            "west": 16.3,
+            "south": 48.18,
+            "east": 16.4,
+            "north": 48.24
+          },
+          "temporal_extent": [
+            "2024-06-01",
+            "2024-06-30"
+          ],
+          "bands": [
+            "B04",
+            "B08"
+          ]
+        }
+      },
+      "ndvi1": {
+        "process_id": "ndvi",
+        "arguments": {
+          "data": {
+            "from_node": "load1"
+          },
+          "nir": "B08",
+          "red": "B04",
+          "target_band": "ndvi"
+        }
+      },
+      "apply1": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "ndvi1"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "add",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 1.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply2": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply1"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "multiply",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 100.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply3": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply2"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "subtract",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 50.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply4": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply3"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "divide",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 2.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply5": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply4"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "multiply",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 1.5
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply6": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply5"
+          },
+          "process": {
+            "process_graph": {
+              "p1": {
+                "process_id": "add",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 0.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply7": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply6"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "add",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 0.5
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply8": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply7"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "multiply",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 1.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply9": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply8"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "subtract",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 0.1
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply10": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply9"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "divide",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 1.1
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply11": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply10"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "multiply",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 0.9
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "reduce1": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": {
+            "from_node": "apply11"
+          },
+          "dimension": "t",
+          "reducer": {
+            "process_graph": {
+              "mean1": {
+                "process_id": "mean",
+                "arguments": {
+                  "data": {
+                    "from_parameter": "data"
+                  }
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "save1": {
+        "process_id": "save_result",
+        "arguments": {
+          "data": {
+            "from_node": "reduce1"
+          },
+          "format": "PNG"
+        },
+        "result": true
+      }
+    }
+  },
+  "title": "Wien NDVI 15-node \u2014 no mask (orbit \u21c4 JonaAI A/B)"
+}

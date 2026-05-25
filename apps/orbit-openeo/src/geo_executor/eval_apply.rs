@@ -354,37 +354,63 @@ impl GeoExecutor {
                 "apply: input is not a downloaded cube (run load_collection + ndvi first): {e}"
             ))
         })?;
-        // Pick the primary band: prefer an index band (ndvi/ndmi/...) if
-        // present, otherwise the first non-SCL band.
-        const F32_INDEX_BANDS: &[&str] = &["ndvi", "ndmi", "ndwi", "evi", "savi", "msavi"];
-        let band_key: String = F32_INDEX_BANDS
-            .iter()
-            .find(|k| cube.bands.contains_key(**k))
-            .map(|s| s.to_string())
-            .or_else(|| {
-                cube.bands
-                    .keys()
-                    .find(|k| k.as_str() != "SCL")
-                    .cloned()
-            })
-            .ok_or_else(|| ExecError::InvalidGraph(
-                "apply: __cube.bands has no usable band".into(),
-            ))?;
-        // B1: band_key flows into scratch_dir.join via the output path.
-        super::identifier::validate_identifier(&band_key, "apply.band_key")?;
-        let paths: Vec<PathBuf> = cube.take_band(&band_key).map_err(|_| {
-            ExecError::InvalidGraph(format!("apply: band `{band_key}` vanished from cube"))
-        })?;
-        if paths.is_empty() {
-            return Err(ExecError::Backend("apply: empty input cube".into()));
+        // **BUG-005 fix (2026-05-24)**: iterate over EVERY non-SCL band
+        // (was: pick one allow-listed band and silently drop the rest).
+        // openEO `apply(data, process)` spec: "Applies a unary process
+        // (anything in `data` is replaced with the result of the inner
+        // process) **on every value** in the data cube" — i.e. every
+        // band, every scene, every pixel. Previously the impl picked one
+        // band and dropped the others; post-merge_cubes multi-band cubes
+        // therefore lost data.
+        //
+        // SCL (categorical 0..=11) is excluded from the per-pixel math
+        // because the inner process is numeric and would corrupt the
+        // classification labels. SCL is forwarded unchanged.
+        let band_keys: Vec<String> = cube
+            .bands
+            .keys()
+            .filter(|k| k.as_str() != "SCL")
+            .cloned()
+            .collect();
+        if band_keys.is_empty() {
+            return Err(ExecError::InvalidGraph(
+                "apply: __cube.bands has no non-SCL band to apply over".into(),
+            ));
+        }
+        for k in &band_keys {
+            super::identifier::validate_identifier(k, "apply.band_key")?;
         }
 
         let n_threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
 
-        let mut out_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
-        for (t, in_path) in paths.iter().enumerate() {
+        // Per-band: take paths, apply math per scene, accumulate output paths.
+        let mut applied_bands: std::collections::BTreeMap<String, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        let mut scene_count_max: u64 = 0;
+        for band_key in &band_keys {
+            // **Reflectance scale (Option B, 2026-05-25)**: if this band
+            // carries a DN→physical scale (from STAC raster:bands.scale),
+            // convert each pixel `v -> v*scale + offset` BEFORE the user's
+            // sub-graph runs, so absolute-value math (thresholds, EVI, …)
+            // sees true reflectance, not raw DN. Identity (1.0, 0.0) for
+            // bands without scale metadata (no-op). The OUTPUT band is in
+            // physical units, so it is NOT re-registered in band_scales.
+            let (scale, offset): (f64, f64) =
+                cube.band_scales.get(band_key).copied().unwrap_or((1.0, 0.0));
+            let paths: Vec<PathBuf> = cube.take_band(band_key).map_err(|_| {
+                ExecError::InvalidGraph(format!("apply: band `{band_key}` vanished from cube"))
+            })?;
+            if paths.is_empty() {
+                return Err(ExecError::Backend(
+                    format!("apply: empty band `{band_key}` in input cube"),
+                ));
+            }
+            scene_count_max = scene_count_max.max(paths.len() as u64);
+
+            let mut out_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
+            for (t, in_path) in paths.iter().enumerate() {
             // Build a (T=1, layers=1, R, C) f32 dataset for this scene.
             let mut rds: RasterDataset<f32> = RasterDatasetBuilder::<f32>::from_files(
                 std::slice::from_ref(in_path),
@@ -406,6 +432,7 @@ impl GeoExecutor {
             // Clone the sub_pg into the worker closure (Arc'd is overkill;
             // serde Value clones are cheap structurally).
             let sub_pg = sub_pg_val.clone();
+            let (w_scale, w_offset) = (scale, offset);
             let worker = move |rdb: &RasterDataBlock<f32>, _dim: Dimension| -> Array3<f32> {
                 let r = rdb.rows();
                 let c = rdb.cols();
@@ -416,7 +443,10 @@ impl GeoExecutor {
                         if !v.is_finite() || v == SENTINEL_NDVI_NA {
                             continue;
                         }
-                        match eval_apply_subgraph(&sub_pg, v as f64) {
+                        // Option B: DN → physical reflectance before the
+                        // user's process. Identity when (1.0, 0.0).
+                        let scaled = v as f64 * w_scale + w_offset;
+                        match eval_apply_subgraph(&sub_pg, scaled) {
                             Ok(n) if n.is_finite() => out[[0, row, col]] = n as f32,
                             Ok(_) => {
                                 // Non-finite (NaN/Inf) — treat as NA.
@@ -458,22 +488,26 @@ impl GeoExecutor {
             )
             .map_err(|e| ExecError::Backend(format!("apply: apply_reduction t={t}: {e}")))?;
             out_paths.push(out_path);
-        }
+            } // end per-scene loop
+            applied_bands.insert(band_key.clone(), out_paths);
+        } // end per-band loop
 
-        // Build the output cube: replace the consumed band's paths with
-        // the new ones; forward every other band unchanged (moved by
-        // value — band_key was already taken above so no need to skip).
-        let scene_count = paths.len() as u64;
+        // Build the output cube: insert every applied band's new paths,
+        // then forward any remaining bands (SCL) that we did not touch.
         let mut out_cube = DataCube::new();
-        out_cube.bands.insert(band_key.clone(), out_paths);
+        let layer_names: Vec<String> = applied_bands.keys().cloned().collect();
+        for (k, v) in applied_bands {
+            out_cube.bands.insert(k, v);
+        }
+        // Forward remaining bands (e.g. SCL) — moved by value.
         for (k, v) in std::mem::take(&mut cube.bands) {
             out_cube.bands.insert(k, v);
         }
         out_cube.bbox = cube.bbox.clone();
-        out_cube.scene_count = Some(scene_count);
-        out_cube.times = Some(scene_count);
-        out_cube.layers = Some(1);
-        out_cube.layer_names = Some(vec![band_key]);
+        out_cube.scene_count = Some(scene_count_max);
+        out_cube.times = Some(scene_count_max);
+        out_cube.layers = Some(layer_names.len() as u64);
+        out_cube.layer_names = Some(layer_names);
         Ok(out_cube.to_envelope())
     }
 }

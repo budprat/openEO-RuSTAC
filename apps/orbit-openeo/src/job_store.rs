@@ -173,6 +173,16 @@ pub trait JobStore: Send + Sync {
     /// Attach an output asset entry to a job. The bytes themselves live
     /// in [`crate::file_store::FileStore`]; this stores only metadata.
     async fn add_asset(&self, id: &str, asset: JobAsset) -> Result<(), JobError>;
+
+    /// **Orphan recovery (2026-05-25, ported from JonaAI
+    /// `jobs.py` startup recovery)**: transition every job stuck in a
+    /// non-terminal state (`Queued` or `Running`) to `Error`. Called once
+    /// at server startup: a job left `running` means the process died
+    /// mid-execution (crash / restart / OOM), so it can never finish and
+    /// must not appear "in progress" forever. Returns the number of jobs
+    /// recovered. Terminal states (`Finished`/`Error`/`Canceled`) and
+    /// `Created` (never started) are left untouched.
+    async fn recover_orphans(&self) -> Result<usize, JobError>;
 }
 
 /// In-memory store backed by a `Mutex<Vec<JobRecord>>` and an atomic counter.
@@ -277,6 +287,20 @@ impl JobStore for InMemoryJobStore {
         rec.assets.push(asset);
         rec.updated = Self::now();
         Ok(())
+    }
+
+    async fn recover_orphans(&self) -> Result<usize, JobError> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Self::now();
+        let mut n = 0usize;
+        for rec in g.iter_mut() {
+            if matches!(rec.status, JobStatus::Queued | JobStatus::Running) {
+                rec.status = JobStatus::Error;
+                rec.updated = now;
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -524,6 +548,20 @@ impl JobStore for SqliteJobStore {
         tx.commit().await.map_err(|e| JobError::Backend(format!("commit: {e}")))?;
         Ok(())
     }
+
+    async fn recover_orphans(&self) -> Result<usize, JobError> {
+        // Single UPDATE: flip queued/running → error. Matches JonaAI's
+        // startup raw-SQL recovery (jobs.py:93).
+        let res = sqlx::query(
+            "UPDATE jobs SET status = 'error', updated = ? \
+             WHERE status IN ('queued', 'running')",
+        )
+        .bind(Self::now() as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| JobError::Backend(format!("recover_orphans: {e}")))?;
+        Ok(res.rows_affected() as usize)
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +604,29 @@ mod tests {
     async fn get_unknown_id_returns_not_found() {
         let s = InMemoryJobStore::new();
         assert!(matches!(s.get("missing").await, Err(JobError::NotFound(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recover_orphans_flips_running_and_queued_to_error() {
+        let s = InMemoryJobStore::new();
+        let running = s.create("u", None, None, graph()).await.unwrap();
+        let queued = s.create("u", None, None, graph()).await.unwrap();
+        let created = s.create("u", None, None, graph()).await.unwrap();
+        let finished = s.create("u", None, None, graph()).await.unwrap();
+        s.set_status(&running.id, JobStatus::Running).await.unwrap();
+        s.set_status(&queued.id, JobStatus::Queued).await.unwrap();
+        s.set_status(&finished.id, JobStatus::Finished).await.unwrap();
+        // created stays Created.
+        let n = s.recover_orphans().await.unwrap();
+        assert_eq!(n, 2, "only running + queued recovered");
+        assert_eq!(s.get(&running.id).await.unwrap().status, JobStatus::Error);
+        assert_eq!(s.get(&queued.id).await.unwrap().status, JobStatus::Error);
+        assert_eq!(s.get(&created.id).await.unwrap().status, JobStatus::Created,
+                   "Created (never started) must not be touched");
+        assert_eq!(s.get(&finished.id).await.unwrap().status, JobStatus::Finished,
+                   "Finished (terminal) must not be touched");
+        // Idempotent: second call recovers nothing.
+        assert_eq!(s.recover_orphans().await.unwrap(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -717,6 +778,23 @@ mod tests {
         assert_eq!(got.status, JobStatus::Created);
         assert_eq!(got.progress, Some(0.0));
         assert!(got.assets.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sqlite_recover_orphans_flips_running_queued_to_error() {
+        let s = sqlite_store().await;
+        let running = s.create("u", None, None, graph()).await.unwrap();
+        let queued = s.create("u", None, None, graph()).await.unwrap();
+        let finished = s.create("u", None, None, graph()).await.unwrap();
+        s.set_status(&running.id, JobStatus::Running).await.unwrap();
+        s.set_status(&queued.id, JobStatus::Queued).await.unwrap();
+        s.set_status(&finished.id, JobStatus::Finished).await.unwrap();
+        let n = s.recover_orphans().await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(s.get(&running.id).await.unwrap().status, JobStatus::Error);
+        assert_eq!(s.get(&queued.id).await.unwrap().status, JobStatus::Error);
+        assert_eq!(s.get(&finished.id).await.unwrap().status, JobStatus::Finished);
+        assert_eq!(s.recover_orphans().await.unwrap(), 0, "idempotent");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

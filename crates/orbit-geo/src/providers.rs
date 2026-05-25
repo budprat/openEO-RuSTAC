@@ -603,6 +603,10 @@ pub use eo_io::vsi::vsi_rewrite;
 // lives in [`crate::async_download`] (feature `async-tiff`).
 #[cfg(feature = "async-tiff")]
 pub use crate::async_download::download_via_async_tiff_with_crs;
+#[cfg(feature = "async-tiff")]
+pub use crate::async_download::{
+    download_via_async_tiff_with_crs_and_meta, BandMetadataHint,
+};
 
 #[cfg(test)]
 mod tests {

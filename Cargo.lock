@@ -3432,8 +3432,10 @@ dependencies = [
  "ndarray",
  "num-traits",
  "object_store",
+ "once_cell",
  "orbit-core",
  "parking_lot",
+ "proj",
  "rayon",
  "reqwest 0.13.3",
  "serde",
@@ -3494,6 +3496,7 @@ dependencies = [
  "serde_yaml",
  "sqlx",
  "subtle",
+ "tempfile",
  "thiserror 2.0.18",
  "tiff",
  "tokio",
@@ -4519,6 +4522,18 @@ dependencies = [
  "syn",
  "version_check",
  "yansi",
+]
+
+[[package]]
+name = "proj"
+version = "0.31.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10730bc2a73edc2eb5673204b51d5459eae92a87c813cb6267c64066cbce9de2"
+dependencies = [
+ "libc",
+ "num-traits",
+ "proj-sys",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

@@ -8,6 +8,32 @@ use serde_json::Value;
 
 use crate::executor::ExecError;
 
+/// Per-band metadata harvested from STAC `proj:*` + `raster:bands` extensions.
+/// All fields optional — present only when the STAC item exposed them. Lets
+/// the P3 streaming path skip the per-source `Dataset::open` probe when the
+/// search response already carried the data.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BandMetadata {
+    /// EPSG code (e.g. 32633). May fall back to the item-level `proj:epsg`.
+    pub epsg: Option<u32>,
+    /// GDAL-ordered geo-transform `[origin_x, pix_w, rot_x, origin_y, rot_y, pix_h]`.
+    pub geo_transform: Option<[f64; 6]>,
+    /// `(cols, rows)` in pixels (note `proj:shape` is `[rows, cols]` per spec).
+    pub raster_size: Option<(usize, usize)>,
+    /// Source band dtype as the GDAL `dataType` attribute name (`UInt16`, `Int16`, `Byte`, ...).
+    pub dtype: Option<String>,
+    /// Source band nodata value, if set.
+    pub nodata: Option<f64>,
+    /// **Reflectance scale (2026-05-25)**: STAC `raster:bands.scale`.
+    /// For Sentinel-2 L2A surface-reflectance bands this is `0.0001`
+    /// (DN → reflectance). `None` (or 1.0) means values are already in
+    /// their natural unit (e.g. SCL classification codes).
+    pub scale: Option<f64>,
+    /// STAC `raster:bands.offset` — additive offset applied AFTER scale:
+    /// `physical = DN * scale + offset`. `None` means 0.0.
+    pub offset: Option<f64>,
+}
+
 /// One STAC item returned by the search call. Band-flexible: the
 /// `bands` map carries every asset href the searcher could resolve
 /// for the requested band list (keyed by the canonical band name as
@@ -23,6 +49,11 @@ pub struct StacScene {
     /// STAC asset map (e.g. "B04", "B08", "SCL"). Empty when the
     /// feature exposed no requested band.
     pub bands: BTreeMap<String, String>,
+    /// Per-band metadata harvested from `proj:*` + `raster:bands`. Same
+    /// keying as `bands`. Empty map entries (or a missing key) mean the
+    /// downstream P3 path must fall back to `Dataset::open` probing.
+    #[serde(default)]
+    pub band_metadata: BTreeMap<String, BandMetadata>,
 }
 
 /// Owned collection of STAC scenes returned by a search. Implements
@@ -206,11 +237,26 @@ impl StacSearcher for HttpStacSearcher {
             tracing::warn!(attempt, url = %url, "STAC search retry after {dly:?}");
             tokio::time::sleep(dly).await;
         };
-        let features = payload
+        let mut features = payload
             .get("features")
             .and_then(|f| f.as_array())
             .cloned()
             .unwrap_or_default();
+        // **Cloud-cover sort (2026-05-25, ported from JonaAI
+        // `_sort_stac_items_by_cloud_cover`)**: order returned items
+        // ascending by `properties.eo:cloud_cover` so the least-cloudy
+        // scenes lead the time axis. Items lacking the property sort last
+        // (treated as worst-case 101%). Stable sort preserves the STAC
+        // server's secondary ordering (usually datetime) for ties.
+        features.sort_by(|a, b| {
+            let cc = |f: &Value| -> f64 {
+                f.get("properties")
+                    .and_then(|p| p.get("eo:cloud_cover"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(101.0)
+            };
+            cc(a).partial_cmp(&cc(b)).unwrap_or(std::cmp::Ordering::Equal)
+        });
         let mut scenes = Vec::with_capacity(features.len());
         for f in features {
             let id = f
@@ -219,17 +265,24 @@ impl StacSearcher for HttpStacSearcher {
                 .unwrap_or("<no-id>")
                 .to_string();
             let assets = f.get("assets").cloned().unwrap_or(Value::Null);
+            // Item-level `proj:epsg` falls through to assets that omit it.
+            let item_epsg = f
+                .get("properties")
+                .and_then(|p| p.get("proj:epsg"))
+                .and_then(|v| v.as_u64())
+                .map(|u| u as u32);
             // Collect EVERY asset href from the feature. The executor
             // layer then filters down to the requested `bands` subset.
             // Aliases (`red`→`B04`, `nir`→`B08`) are normalised to the
             // canonical S2 band name so executors can ask for "B04" and
             // hit either keying.
             let bands = collect_band_hrefs(&assets);
+            let band_metadata = collect_band_metadata(&assets, item_epsg);
             if bands.is_empty() {
                 tracing::warn!(item = %id, "skipping scene with no asset hrefs");
                 continue;
             }
-            scenes.push(StacScene { id, bands });
+            scenes.push(StacScene { id, bands, band_metadata });
         }
         Ok(scenes)
     }
@@ -253,6 +306,112 @@ fn collect_band_hrefs(assets: &Value) -> BTreeMap<String, String> {
         out.entry(canonical).or_insert(href);
     }
     out
+}
+
+/// Walk the asset object, pulling `proj:*` + `raster:bands` extension fields
+/// into a `BandMetadata` per canonical band name. Missing fields stay `None`.
+/// `item_epsg` is the item-level `proj:epsg` fallback for assets that omit it.
+fn collect_band_metadata(
+    assets: &Value,
+    item_epsg: Option<u32>,
+) -> BTreeMap<String, BandMetadata> {
+    let mut out: BTreeMap<String, BandMetadata> = BTreeMap::new();
+    let map = match assets.as_object() {
+        Some(m) => m,
+        None => return out,
+    };
+    for (k, v) in map.iter() {
+        // Only emit metadata for assets that actually have an href —
+        // mirrors `collect_band_hrefs` so the two maps stay in lock-step.
+        if v.get("href").and_then(|h| h.as_str()).is_none() {
+            continue;
+        }
+        let canonical = canonical_band_name(k);
+        let meta = parse_asset_band_metadata(v, item_epsg);
+        // First writer wins (same as `collect_band_hrefs`), so aliases
+        // never clobber a canonical key.
+        out.entry(canonical).or_insert(meta);
+    }
+    out
+}
+
+/// Parse a single STAC asset object into a `BandMetadata`. All fields are
+/// best-effort: a malformed or missing extension just leaves that field `None`.
+fn parse_asset_band_metadata(asset: &Value, item_epsg: Option<u32>) -> BandMetadata {
+    let epsg = asset
+        .get("proj:epsg")
+        .and_then(|v| v.as_u64())
+        .map(|u| u as u32)
+        .or(item_epsg);
+    let geo_transform = asset
+        .get("proj:transform")
+        .and_then(|v| v.as_array())
+        .and_then(|v| stac_transform_to_gdal(v));
+    let raster_size = asset
+        .get("proj:shape")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            // STAC `proj:shape` is `[rows, cols]`; we store as `(cols, rows)`
+            // to match `gdal::Dataset::raster_size()`.
+            let rows = arr.first().and_then(|x| x.as_u64()).map(|u| u as usize)?;
+            let cols = arr.get(1).and_then(|x| x.as_u64()).map(|u| u as usize)?;
+            Some((cols, rows))
+        });
+    let raster_bands = asset.get("raster:bands").and_then(|v| v.as_array());
+    let first_band = raster_bands.and_then(|a| a.first());
+    let dtype = first_band
+        .and_then(|b| b.get("data_type"))
+        .and_then(|v| v.as_str())
+        .map(stac_dtype_to_gdal_name);
+    let nodata = first_band
+        .and_then(|b| b.get("nodata"))
+        .and_then(|v| v.as_f64());
+    let scale = first_band
+        .and_then(|b| b.get("scale"))
+        .and_then(|v| v.as_f64());
+    let offset = first_band
+        .and_then(|b| b.get("offset"))
+        .and_then(|v| v.as_f64());
+    BandMetadata { epsg, geo_transform, raster_size, dtype, nodata, scale, offset }
+}
+
+/// Convert a STAC `proj:transform` (6- or 9-element row-major affine
+/// `[a, b, c, d, e, f, (0, 0, 1)]`) to the GDAL geotransform form
+/// `[origin_x, pix_w, rot_x, origin_y, rot_y, pix_h]`.
+fn stac_transform_to_gdal(arr: &[Value]) -> Option<[f64; 6]> {
+    // STAC convention: row-major 2x3 affine [a b c ; d e f] applied as
+    //   x_world = a*col + b*row + c
+    //   y_world = d*col + e*row + f
+    // GDAL convention: [c, a, b, f, d, e].
+    if arr.len() < 6 {
+        return None;
+    }
+    let nums: Vec<f64> = arr.iter().take(6).filter_map(|v| v.as_f64()).collect();
+    if nums.len() != 6 {
+        return None;
+    }
+    Some([nums[2], nums[0], nums[1], nums[5], nums[3], nums[4]])
+}
+
+/// Map STAC `raster:bands[].data_type` strings to the GDAL `dataType`
+/// attribute names used by VRT XML (`UInt16`, `Int16`, `Byte`, `Float32`, ...).
+fn stac_dtype_to_gdal_name(s: &str) -> String {
+    match s {
+        "uint8" => "Byte".to_string(),
+        "int8" => "Int8".to_string(),
+        "uint16" => "UInt16".to_string(),
+        "int16" => "Int16".to_string(),
+        "uint32" => "UInt32".to_string(),
+        "int32" => "Int32".to_string(),
+        "uint64" => "UInt64".to_string(),
+        "int64" => "Int64".to_string(),
+        "float32" => "Float32".to_string(),
+        "float64" => "Float64".to_string(),
+        // Unknown — pass through; downstream `Dataset::open` probe will
+        // disambiguate. The probe-bypass cache check requires a known
+        // dtype so this just declines the fast path.
+        other => other.to_string(),
+    }
 }
 
 /// Normalise legacy STAC asset aliases (`red`→`B04`, `nir`→`B08`,
@@ -386,6 +545,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_stac_searcher_sorts_by_cloud_cover_ascending() {
+        // Two features: cloudy (80%) listed FIRST, clear (5%) listed
+        // SECOND. After the cloud-cover sort, the clear scene must lead.
+        let server = MockServer::start().await;
+        let payload = json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "id": "CLOUDY",
+                "properties": { "eo:cloud_cover": 80.0 },
+                "assets": { "B04": { "href": "https://example.com/cloudy_r.tif" },
+                            "B08": { "href": "https://example.com/cloudy_n.tif" } }
+            },{
+                "id": "CLEAR",
+                "properties": { "eo:cloud_cover": 5.0 },
+                "assets": { "B04": { "href": "https://example.com/clear_r.tif" },
+                            "B08": { "href": "https://example.com/clear_n.tif" } }
+            }]
+        });
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(payload))
+            .mount(&server)
+            .await;
+        let searcher = HttpStacSearcher::new(server.uri())
+            .with_url_policy(crate::url_policy::UrlPolicy::relaxed_dev());
+        let scenes = searcher
+            .search("sentinel-2-l2a", [144.5, -36.6, 144.7, -36.4], None, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(scenes.len(), 2);
+        assert_eq!(scenes[0].id, "CLEAR", "least-cloudy scene must lead after sort");
+        assert_eq!(scenes[1].id, "CLOUDY");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn http_stac_searcher_500_maps_to_backend_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -497,10 +691,18 @@ mod tests {
     #[test]
     fn feature_collection_band_paths_collects_in_scene_order() {
         use orbit_geo::BandPathResolver;
-        let mut s0 = StacScene { id: "s0".into(), bands: BTreeMap::new() };
+        let mut s0 = StacScene {
+            id: "s0".into(),
+            bands: BTreeMap::new(),
+            band_metadata: BTreeMap::new(),
+        };
         s0.bands.insert("B04".into(), "/tmp/s0_red.tif".into());
         s0.bands.insert("B08".into(), "/tmp/s0_nir.tif".into());
-        let mut s1 = StacScene { id: "s1".into(), bands: BTreeMap::new() };
+        let mut s1 = StacScene {
+            id: "s1".into(),
+            bands: BTreeMap::new(),
+            band_metadata: BTreeMap::new(),
+        };
         s1.bands.insert("B04".into(), "/tmp/s1_red.tif".into());
         s1.bands.insert("B08".into(), "/tmp/s1_nir.tif".into());
         let fc: FeatureCollection = vec![s0, s1].into();
@@ -514,11 +716,23 @@ mod tests {
     #[test]
     fn feature_collection_band_paths_skips_scenes_missing_band() {
         use orbit_geo::BandPathResolver;
-        let mut s0 = StacScene { id: "s0".into(), bands: BTreeMap::new() };
+        let mut s0 = StacScene {
+            id: "s0".into(),
+            bands: BTreeMap::new(),
+            band_metadata: BTreeMap::new(),
+        };
         s0.bands.insert("B04".into(), "/tmp/s0_red.tif".into());
         // s1 has no B04 — should be silently dropped.
-        let s1 = StacScene { id: "s1".into(), bands: BTreeMap::new() };
-        let mut s2 = StacScene { id: "s2".into(), bands: BTreeMap::new() };
+        let s1 = StacScene {
+            id: "s1".into(),
+            bands: BTreeMap::new(),
+            band_metadata: BTreeMap::new(),
+        };
+        let mut s2 = StacScene {
+            id: "s2".into(),
+            bands: BTreeMap::new(),
+            band_metadata: BTreeMap::new(),
+        };
         s2.bands.insert("B04".into(), "/tmp/s2_red.tif".into());
         let fc = FeatureCollection::new(vec![s0, s1, s2]);
         assert_eq!(fc.band_paths("B04"), vec![
@@ -527,5 +741,121 @@ mod tests {
         ]);
         // Unknown band yields empty.
         assert!(fc.band_paths("SCL").is_empty());
+    }
+
+    // ---------- P3-fast — STAC raster + proj extension → BandMetadata ----------
+
+    /// Real Element84 v1 response shape (subset) — proves the parser
+    /// lands every field correctly when fed a production-style payload.
+    fn element84_fixture_features() -> Value {
+        json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "id": "S2A_33UWP_20240601_0_L2A",
+                "properties": { "proj:epsg": 32633 },
+                "assets": {
+                    "red": {
+                        "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B04.tif",
+                        "proj:transform": [10, 0, 499980, 0, -10, 5400000],
+                        "proj:shape": [10980, 10980],
+                        "raster:bands": [{
+                            "nodata": 0,
+                            "data_type": "uint16",
+                            "spatial_resolution": 10,
+                            "scale": 0.0001,
+                            "offset": 0.0
+                        }]
+                    },
+                    "nir": {
+                        "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/B08.tif",
+                        "proj:transform": [10, 0, 499980, 0, -10, 5400000],
+                        "proj:shape": [10980, 10980],
+                        "raster:bands": [{
+                            "nodata": 0,
+                            "data_type": "uint16"
+                        }]
+                    },
+                    "scl": {
+                        "href": "https://sentinel-cogs.s3.us-west-2.amazonaws.com/SCL.tif",
+                        "proj:transform": [20, 0, 499980, 0, -20, 5400000],
+                        "proj:shape": [5490, 5490],
+                        "raster:bands": [{
+                            "nodata": 0,
+                            "data_type": "uint8"
+                        }]
+                    }
+                }
+            }]
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parses_proj_and_raster_extensions_into_band_metadata() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(element84_fixture_features()))
+            .mount(&server)
+            .await;
+        let scenes = HttpStacSearcher::new(server.uri())
+            .with_url_policy(crate::url_policy::UrlPolicy::relaxed_dev())
+            .search("sentinel-2-l2a", [16.30, 48.18, 16.40, 48.24], None, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(scenes.len(), 1);
+        let s = &scenes[0];
+        // B04 (red) — 10 m, uint16, EPSG inherited from item.
+        let b04 = s.band_metadata.get("B04").expect("B04 metadata");
+        assert_eq!(b04.epsg, Some(32633));
+        assert_eq!(b04.geo_transform, Some([499980.0, 10.0, 0.0, 5400000.0, 0.0, -10.0]));
+        assert_eq!(b04.raster_size, Some((10980, 10980)));
+        assert_eq!(b04.dtype.as_deref(), Some("UInt16"));
+        assert_eq!(b04.nodata, Some(0.0));
+        // Reflectance scale (Option B): B04 carries 0.0001 DN→reflectance.
+        assert_eq!(b04.scale, Some(0.0001));
+        assert_eq!(b04.offset, Some(0.0));
+        // B08 (nir) — same grid, no scale in this fixture → None.
+        let b08 = s.band_metadata.get("B08").expect("B08 metadata");
+        assert_eq!(b08.raster_size, Some((10980, 10980)));
+        assert_eq!(b08.dtype.as_deref(), Some("UInt16"));
+        assert_eq!(b08.scale, None, "B08 fixture has no scale → None");
+        // SCL — 20 m grid, uint8 → Byte.
+        let scl = s.band_metadata.get("SCL").expect("SCL metadata");
+        assert_eq!(scl.epsg, Some(32633));
+        assert_eq!(scl.geo_transform, Some([499980.0, 20.0, 0.0, 5400000.0, 0.0, -20.0]));
+        assert_eq!(scl.raster_size, Some((5490, 5490)));
+        assert_eq!(scl.dtype.as_deref(), Some("Byte"));
+        assert_eq!(scl.nodata, Some(0.0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn band_metadata_empty_when_extensions_missing() {
+        // Item has hrefs but no proj:* or raster:bands — every BandMetadata
+        // field must stay `None` so downstream falls back to probe.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "features": [{
+                    "id": "no-ext",
+                    "assets": {
+                        "red": { "href": "https://example.com/r.tif" }
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let scenes = HttpStacSearcher::new(server.uri())
+            .with_url_policy(crate::url_policy::UrlPolicy::relaxed_dev())
+            .search("c", [0.0, 0.0, 1.0, 1.0], None, 1, None)
+            .await
+            .unwrap();
+        let s = &scenes[0];
+        let b04 = s.band_metadata.get("B04").expect("B04 metadata present even when extensions absent");
+        assert_eq!(b04.epsg, None);
+        assert_eq!(b04.geo_transform, None);
+        assert_eq!(b04.raster_size, None);
+        assert_eq!(b04.dtype, None);
+        assert_eq!(b04.nodata, None);
     }
 }

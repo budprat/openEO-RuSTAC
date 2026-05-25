@@ -30,7 +30,7 @@ stac           = ["dep:stac", "dep:stac-io", "dep:stac-extensions", "dep:stac-ap
 # binding once that crate publishes a 0.17-compatible release.
 stac-duckdb    = ["stac"]
 # Async TIFF reader path (cloud-native, no libgdal dependency on read).
-async-tiff  = ["dep:async-tiff", "dep:object_store"]
+async-tiff  = ["dep:async-tiff", "dep:object_store", "dep:proj", "dep:once_cell"]
 # Compile-time logging integration.
 tracing     = []
 # openEO backend client — consume openEO backends (VITO, CDSE, EODC, ...) as a DataSource.
@@ -65,6 +65,10 @@ gdal               = { version = "0.19", features = ["ndarray"] }
 gdal-src           = { version = "0.3", optional = true }
 async-tiff         = { version = "0.3", features = ["ndarray"], optional = true }
 object_store       = { version = "0.13", features = ["aws", "gcp", "azure", "http"], optional = true }
+# Pure-Rust bbox reprojection via libproj (FFI). Gated behind async-tiff so non-feature builds stay GDAL-only.
+proj               = { version = "0.31", default-features = false, optional = true }
+# Process-global S3 connection-pool cache for the async-tiff path (P2 Option 2).
+once_cell          = { workspace = true, optional = true }
 
 # STAC (optional — gated by the `stac` / `stac-duckdb` features).
 # Versions verified against crates.io 2026-05-21.

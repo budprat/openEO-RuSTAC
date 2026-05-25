@@ -40,6 +40,18 @@ pub struct DataCube {
     #[serde(default)]
     pub bands: BTreeMap<String, Vec<PathBuf>>,
 
+    /// **Reflectance scale (2026-05-25, Option B)**: band_name → (scale,
+    /// offset) for converting stored DN to physical units
+    /// (`physical = DN * scale + offset`). Populated by `load_collection`
+    /// from STAC `raster:bands.scale`/`offset`. A band ABSENT from this
+    /// map (or with scale 1.0) needs no conversion (already physical, e.g.
+    /// SCL classes or a derived index). Compute kernels that read raw
+    /// reflectance for absolute math (apply) consult this; ratio indices
+    /// (ndvi) are scale-invariant and ignore it. Cleared on outputs that
+    /// are already in physical units (index/reduced bands).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub band_scales: BTreeMap<String, (f64, f64)>,
+
     /// Source collection id (e.g. "sentinel-2-l2a"). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collection: Option<String>,
@@ -125,7 +137,20 @@ impl DataCube {
     }
 
     /// Decode by-value, consuming the input `Value` to avoid the inner clone.
+    ///
+    /// **BUG-003 fix (2026-05-24)**: also accepts `__raster` envelopes from
+    /// processes that produce a single mosaic file (e.g. `merge_cubes`,
+    /// `reduce_dimension`). Auto-wraps them as a single-band, single-scene
+    /// `DataCube` so downstream `apply`/`reduce` can operate on
+    /// `merge_cubes` output without an explicit conversion step.
+    /// The synthetic band name is `result` — chosen to be neutral (not in
+    /// the canonical index-band allow-list, exercising the BUG-002 fix's
+    /// "first non-SCL band" fallback path).
     pub fn from_envelope_owned(mut v: Value) -> Result<Self, DataCubeError> {
+        // __raster fast-path: promote single-file mosaic to a 1-band cube.
+        if let Some(raster) = v.as_object_mut().and_then(|m| m.remove("__raster")) {
+            return Self::from_raster_envelope(raster);
+        }
         let inner = match v.as_object_mut().and_then(|m| m.remove("__cube")) {
             Some(inner) => inner,
             None => v,
@@ -134,6 +159,25 @@ impl DataCube {
             return Err(DataCubeError::MissingEnvelope);
         }
         serde_json::from_value(inner).map_err(|e| DataCubeError::Decode(e.to_string()))
+    }
+
+    /// Wrap a `__raster` envelope (single-file mosaic) as a 1-band,
+    /// 1-scene `DataCube`. The band key is `"result"`. Used by
+    /// [`Self::from_envelope_owned`] to bridge processes that emit
+    /// `__raster` (merge_cubes, reduce_dimension) into downstream
+    /// processes that expect `__cube` (apply, mask, reduce).
+    fn from_raster_envelope(raster: Value) -> Result<Self, DataCubeError> {
+        let path = raster
+            .get("path")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| DataCubeError::Decode(
+                "__raster envelope: missing `path` (string)".into(),
+            ))?
+            .to_string();
+        let mut cube = DataCube::new();
+        cube.bands.insert("result".into(), vec![PathBuf::from(&path)]);
+        cube.scene_count = Some(1);
+        Ok(cube)
     }
 
     /// Serialise back into `{"__cube": {...}}` envelope shape.
@@ -171,6 +215,31 @@ mod tests {
         let env = cube.to_envelope();
         let back = DataCube::from_envelope(&env).expect("decode envelope");
         assert_eq!(cube, back, "envelope round-trip preserves all fields");
+    }
+
+    #[test]
+    fn band_scales_round_trip_through_envelope() {
+        // Option B (2026-05-25): per-band (scale, offset) must survive the
+        // __cube envelope so it travels between processes (load → apply).
+        let mut cube = sample_cube();
+        cube.band_scales.insert("B04".into(), (0.0001, 0.0));
+        cube.band_scales.insert("B08".into(), (0.0001, -0.1));
+        let env = cube.to_envelope();
+        // Serializes as a 2-element array per (scale, offset) tuple.
+        assert_eq!(env["__cube"]["band_scales"]["B04"], json!([0.0001, 0.0]));
+        let back = DataCube::from_envelope(&env).expect("decode");
+        assert_eq!(back.band_scales.get("B04"), Some(&(0.0001, 0.0)));
+        assert_eq!(back.band_scales.get("B08"), Some(&(0.0001, -0.1)));
+    }
+
+    #[test]
+    fn empty_band_scales_is_not_serialized() {
+        // skip_serializing_if keeps the envelope clean for scale-less cubes
+        // (SCL-only / derived-index cubes) so existing graphs are unchanged.
+        let cube = sample_cube();
+        let env = cube.to_envelope();
+        assert!(env["__cube"].get("band_scales").is_none(),
+                "empty band_scales must not appear in the envelope");
     }
 
     #[test]

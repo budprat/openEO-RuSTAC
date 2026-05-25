@@ -90,6 +90,15 @@ async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
 
+    // P3: tune libgdal/libcurl for /vsicurl/ range-read streaming. These
+    // are no-ops when ORBIT_VSICURL_STREAM is unset (the legacy download
+    // path doesn't issue range requests from worker threads), but they
+    // matter the moment that flag flips on. Set early — before any
+    // gdal::Dataset::open call in the process — so the first remote
+    // probe in load_collection sees them.
+    #[cfg(feature = "geo-kernel")]
+    configure_gdal_for_vsicurl();
+
     if !args.bind.ip().is_loopback() && args.auth_token.is_none() {
         anyhow::bail!(
             "non-loopback bind {bind} requires ORBIT_OPENEO_AUTH_TOKEN. \
@@ -155,35 +164,87 @@ async fn main() -> Result<()> {
                     Arc::new(HttpStacSearcher::new(&args.stac_url));
                 geo = geo.with_searcher(searcher);
             }
-            // Downloader selection. P1 (in-process gdal::Dataset) is the
-            // default — measured ~2.3× faster than subprocess gdal_translate
-            // on 12 MP Wien S2 (85 s vs 194 s) by skipping per-call
-            // fork-exec + GDAL re-init.
+            // Downloader selection (2026-05-24, post-Task #34):
             //
-            // Set ORBIT_SUBPROCESS_DOWNLOADER=1 to fall back to the legacy
-            // subprocess path (for diagnostic A/B comparisons).
+            // **Default when `async-tiff-downloader` feature is built**: P2
+            // (async-tiff + object_store) with Opt 1 (proj cross-CRS) +
+            // Opt 2 (shared Arc<AmazonS3> pool) + STAC band_metadata hint
+            // (Task #34). Median wall on 12 MP Wien S2 = 76 s (vs P1
+            // 78 s); best case 53 s (~25 % upside). KNOWN TAIL RISK: 1/4
+            // sample runs hit S3 body-error retry storms exceeding 300 s
+            // — flagged in docs/perf/P2_P3_OPTIMIZATION_PROGRESS.md.
             //
-            // Set ORBIT_ASYNC_TIFF_DOWNLOADER=1 to opt into the pure-Rust
-            // async-tiff path (P2). Currently slower on cross-CRS S2 jobs
-            // (falls back to libgdal for reprojection); kept opt-in until
-            // tuned.
+            // Set ORBIT_INPROCESS_DOWNLOADER=1 to fall back to P1
+            // (in-process libgdal eager download) — preferred when S3
+            // transport instability is suspected.
+            //
+            // Set ORBIT_SUBPROCESS_DOWNLOADER=1 for the legacy
+            // subprocess gdal_translate path (diagnostic A/B comparisons).
+            //
+            // Set ORBIT_VSICURL_STREAM=1 for P3: skip the eager download
+            // phase entirely; eval_load.rs writes /vsicurl/<href> straight
+            // into the cube and block_executor issues HTTP range requests
+            // per-block on demand. No temp .tif files. See eval_load.rs.
             #[cfg(feature = "async-tiff-downloader")]
-            if std::env::var("ORBIT_ASYNC_TIFF_DOWNLOADER").as_deref() == Ok("1") {
-                tracing::info!("downloader: async-tiff + object_store (P2, opt-in)");
-                geo = geo.with_async_tiff_downloader();
-            } else if std::env::var("ORBIT_SUBPROCESS_DOWNLOADER").as_deref() == Ok("1") {
-                tracing::info!("downloader: subprocess gdal_translate (legacy, opt-in)");
-                // No-op — GdalTranslateDownloader is the constructor default.
-            } else {
-                tracing::info!("downloader: in-process gdal::Dataset (P1, default)");
-                geo = geo.with_inprocess_downloader();
+            {
+                // Backward-compat: prior to the 2026-05-24 default flip,
+                // `ORBIT_ASYNC_TIFF_DOWNLOADER=1` was the opt-in for P2. It
+                // is now a no-op (P2 is the default), but accept + warn so
+                // existing scripts and CI don't break.
+                if std::env::var("ORBIT_ASYNC_TIFF_DOWNLOADER").as_deref() == Ok("1") {
+                    tracing::warn!(
+                        "ORBIT_ASYNC_TIFF_DOWNLOADER=1 is deprecated -- P2-full is now the \
+                         default. Unset it and use ORBIT_INPROCESS_DOWNLOADER=1 to opt out to P1."
+                    );
+                }
+                if std::env::var("ORBIT_INPROCESS_DOWNLOADER").as_deref() == Ok("1") {
+                    tracing::info!("downloader: in-process gdal::Dataset (P1, opt-out from P2 default)");
+                    geo = geo.with_inprocess_downloader();
+                } else if std::env::var("ORBIT_SUBPROCESS_DOWNLOADER").as_deref() == Ok("1") {
+                    tracing::info!("downloader: subprocess gdal_translate (legacy, opt-in)");
+                    // No-op — GdalTranslateDownloader is the constructor default.
+                } else {
+                    tracing::info!(
+                        "downloader: async-tiff + object_store + STAC hint (P2-full, default; \
+                         set ORBIT_INPROCESS_DOWNLOADER=1 to opt-out to P1)"
+                    );
+                    geo = geo.with_async_tiff_downloader();
+                }
             }
             #[cfg(not(feature = "async-tiff-downloader"))]
             if std::env::var("ORBIT_SUBPROCESS_DOWNLOADER").as_deref() == Ok("1") {
                 tracing::info!("downloader: subprocess gdal_translate (legacy, opt-in)");
             } else {
-                tracing::info!("downloader: in-process gdal::Dataset (P1, default)");
+                tracing::info!("downloader: in-process gdal::Dataset (P1, default — async-tiff feature not built)");
                 geo = geo.with_inprocess_downloader();
+            }
+            // **Task #43 / semaphore sweep**: download concurrency is the
+            // ceiling on simultaneous COG fetches. Default 8; lower values
+            // reduce S3 connection-pool pressure (may cut body-error storms);
+            // higher values only help when many COGs are in flight.
+            if let Ok(v) = std::env::var("ORBIT_DOWNLOAD_CONCURRENCY") {
+                if let Ok(n) = v.parse::<usize>() {
+                    if n >= 1 {
+                        tracing::info!(permits = n, "download concurrency override");
+                        geo = geo.with_download_concurrency(n);
+                    }
+                }
+            }
+            if std::env::var("ORBIT_VSICURL_STREAM").as_deref() == Ok("1") {
+                tracing::info!(
+                    "P3: ORBIT_VSICURL_STREAM=1 — load_collection will skip downloads \
+                     and emit /vsicurl/ paths into the cube (block-level range reads)"
+                );
+            }
+            // Observability lever (Task #38 method, env-exposed): pin the
+            // scratch dir to a user-owned path. Clears the auto-cleanup flag
+            // so intermediate GeoTIFFs survive job completion — useful for
+            // value-verifying a pipeline (gdalinfo on each stage).
+            if let Ok(dir) = std::env::var("ORBIT_SCRATCH_DIR") {
+                if !dir.is_empty() {
+                    tracing::info!(scratch_dir = %dir, "scratch dir pinned (preserved on shutdown)");
+                    geo = geo.with_scratch_dir(std::path::PathBuf::from(dir));
+                }
             }
             Arc::new(geo)
         }
@@ -205,6 +266,16 @@ async fn main() -> Result<()> {
         let store = SqliteJobStore::open(&args.db_url)
             .await
             .map_err(|e| anyhow::anyhow!("opening {}: {e}", args.db_url))?;
+        // **Orphan recovery (2026-05-25)**: a persistent store can hold
+        // jobs left `running`/`queued` by a previous process that crashed
+        // or was killed mid-execution. They can never complete, so flip
+        // them to `error` at startup instead of leaving them "in progress"
+        // forever. (No-op for the in-memory store, which starts empty.)
+        match store.recover_orphans().await {
+            Ok(0) => {}
+            Ok(n) => tracing::warn!(recovered = n, "recovered orphaned jobs (queued/running → error) from prior run"),
+            Err(e) => tracing::error!(error = %e, "orphan recovery failed at startup"),
+        }
         tracing::info!(url = %args.db_url, "wired SqliteJobStore (jobs survive restarts)");
         builder = builder.with_jobs(Arc::new(store) as Arc<dyn JobStore>);
     } else {
@@ -218,6 +289,37 @@ async fn main() -> Result<()> {
     tracing::info!(addr = %args.bind, "orbit-openeo listening");
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
     Ok(())
+}
+
+/// Tune libgdal/libcurl for `/vsicurl/` block-level range reads (P3).
+///
+/// All values are conservative defaults from the GDAL `/vsicurl/`
+/// documentation. Each `set_config_option` call is best-effort — failures
+/// are logged but non-fatal (GDAL falls back to its built-in defaults).
+///
+/// These affect *all* `Dataset::open("/vsicurl/...")` calls in the
+/// process, regardless of whether ORBIT_VSICURL_STREAM is set; the
+/// values were chosen to be safe no-ops for the existing
+/// download-then-read path too.
+#[cfg(feature = "geo-kernel")]
+fn configure_gdal_for_vsicurl() {
+    // 16 KB chunks balance round-trip count vs over-fetch. 512 MB
+    // in-process cache absorbs hot blocks. HEAD-on-every-open is wasteful
+    // — vsicurl can probe with the first GET instead.
+    let opts: &[(&str, &str)] = &[
+        ("VSI_CACHE", "TRUE"),
+        ("VSI_CACHE_SIZE", "536870912"),
+        ("CPL_VSIL_CURL_CHUNK_SIZE", "16384"),
+        ("GDAL_HTTP_MAX_RETRY", "5"),
+        ("GDAL_HTTP_RETRY_DELAY", "1"),
+        ("CPL_VSIL_CURL_USE_HEAD", "NO"),
+    ];
+    for (k, v) in opts {
+        if let Err(e) = gdal::config::set_config_option(k, v) {
+            tracing::warn!(key = k, value = v, err = %e,
+                "P3: failed to set GDAL config (non-fatal)");
+        }
+    }
 }
 
 fn init_tracing() {

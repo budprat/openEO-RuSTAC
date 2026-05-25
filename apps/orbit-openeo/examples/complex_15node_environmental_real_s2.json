@@ -1,0 +1,132 @@
+{
+  "process": {
+    "process_graph": {
+      "load1": {
+        "process_id": "load_collection",
+        "arguments": {
+          "id": "sentinel-2-l2a",
+          "spatial_extent": { "west": 16.3, "south": 48.18, "east": 16.4, "north": 48.24 },
+          "temporal_extent": ["2024-06-01", "2024-06-30"],
+          "bands": ["B03", "B04", "B08", "SCL"]
+        }
+      },
+      "mask1": {
+        "process_id": "mask_scl_dilation",
+        "arguments": { "data": { "from_node": "load1" } }
+      },
+      "ndvi1": {
+        "process_id": "ndvi",
+        "arguments": { "data": { "from_node": "mask1" }, "nir": "B08", "red": "B04", "target_band": "ndvi" }
+      },
+      "ndwi1": {
+        "process_id": "ndvi",
+        "arguments": { "data": { "from_node": "mask1" }, "nir": "B03", "red": "B08", "target_band": "ndwi" }
+      },
+      "ndvi_mean": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": { "from_node": "ndvi1" },
+          "dimension": "t",
+          "reducer": { "process_graph": {
+            "m": { "process_id": "mean", "arguments": { "data": { "from_parameter": "data" } }, "result": true }
+          }}
+        }
+      },
+      "ndvi_max": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": { "from_node": "ndvi1" },
+          "dimension": "t",
+          "reducer": { "process_graph": {
+            "mx": { "process_id": "max", "arguments": { "data": { "from_parameter": "data" } }, "result": true }
+          }}
+        }
+      },
+      "best_green": {
+        "process_id": "merge_cubes",
+        "arguments": {
+          "cube1": { "from_node": "ndvi_mean" },
+          "cube2": { "from_node": "ndvi_max" },
+          "overlap_resolver": { "process_graph": {
+            "r": { "process_id": "mean", "arguments": { "data": { "from_parameter": "data" } }, "result": true }
+          }}
+        }
+      },
+      "ndwi_mean": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": { "from_node": "ndwi1" },
+          "dimension": "t",
+          "reducer": { "process_graph": {
+            "m": { "process_id": "mean", "arguments": { "data": { "from_parameter": "data" } }, "result": true }
+          }}
+        }
+      },
+      "merge_vigor": {
+        "process_id": "merge_cubes",
+        "arguments": {
+          "cube1": { "from_node": "best_green" },
+          "cube2": { "from_node": "ndwi_mean" }
+        }
+      },
+      "vigor_index": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": { "from_node": "merge_vigor" },
+          "dimension": "bands",
+          "reducer": { "process_graph": {
+            "m": { "process_id": "mean", "arguments": { "data": { "from_parameter": "data" } }, "result": true }
+          }}
+        }
+      },
+      "green_clip": {
+        "process_id": "apply",
+        "arguments": {
+          "data": { "from_node": "vigor_index" },
+          "process": { "process_graph": {
+            "c": { "process_id": "clip", "arguments": { "x": { "from_parameter": "x" }, "min": 0.0, "max": 1.0 }, "result": true }
+          }}
+        }
+      },
+      "ndvi_range": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": { "from_node": "ndvi1" },
+          "dimension": "t",
+          "reducer": { "process_graph": {
+            "mx": { "process_id": "max", "arguments": { "data": { "from_parameter": "data" } } },
+            "mn": { "process_id": "min", "arguments": { "data": { "from_parameter": "data" } } },
+            "rng": { "process_id": "subtract", "arguments": { "x": { "from_node": "mx" }, "y": { "from_node": "mn" } }, "result": true }
+          }}
+        }
+      },
+      "instability": {
+        "process_id": "rename_labels",
+        "arguments": {
+          "data": { "from_node": "ndvi_range" },
+          "dimension": "bands",
+          "source": ["ndvi"],
+          "target": ["result"]
+        }
+      },
+      "stress": {
+        "process_id": "merge_cubes",
+        "arguments": {
+          "cube1": { "from_node": "green_clip" },
+          "cube2": { "from_node": "instability" },
+          "overlap_resolver": { "process_graph": {
+            "mx": { "process_id": "max", "arguments": { "data": { "from_parameter": "data" } } },
+            "mn": { "process_id": "min", "arguments": { "data": { "from_parameter": "data" } } },
+            "dv": { "process_id": "subtract", "arguments": { "x": { "from_node": "mx" }, "y": { "from_node": "mn" } }, "result": true }
+          }}
+        }
+      },
+      "save1": {
+        "process_id": "save_result",
+        "arguments": { "data": { "from_node": "stress" }, "format": "PNG" },
+        "result": true
+      }
+    }
+  },
+  "title": "Wien riparian vegetation-water stress 15-node — exercises merge_cubes Case1+Case2, compound reducer, reduce(bands), rename_labels"
+}

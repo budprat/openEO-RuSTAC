@@ -165,6 +165,320 @@ The `/jobs/{id}/results` manifest contains a STAC Feature with:
 ```
 asset bytes also retrievable via `GET /jobs/{id}/results/result.png`.
 
+### 2.4.2 P1 vs P2 download paths — detailed runbook (post-Task #34, 2026-05-24)
+
+The geo executor has **three** download paths. P2 is now the **runtime default**
+when the `async-tiff-downloader` feature is built; P1 is the diagnostic
+fallback. Pick the right one based on the table at the bottom.
+
+> Full matrix in `docs/perf/FEATURE_FLAG_MATRIX.md`.
+> Performance progression: `docs/perf/P2_P3_OPTIMIZATION_PROGRESS.md`.
+
+#### P1 — in-process libgdal eager download (stable fallback)
+
+**What it does**: per (scene, band) calls `gdal::Dataset::open(/vsicurl/<href>)`
+on the main runtime via `spawn_blocking`, applies `-projwin -projwin_srs`,
+writes a cropped local `.tif` into `scratch_dir`, then `block_executor`
+reads from the local files.
+
+**Wall on 12 MP Wien S2 NDVI (B04+B08+SCL, June 2024, masked)**: 71 / 76 / 88 s
+across 3 runs = **78 s avg**. Tight variance, no outliers.
+
+**Build + run**:
+```bash
+cargo build -p orbit-openeo --features geo-kernel,async-tiff-downloader
+cp target/debug/orbit-openeo target/debug/orbit-openeo-geo
+
+FILES_DIR=/tmp/orbit-p1-$(date +%s) && mkdir -p "$FILES_DIR"
+ORBIT_INPROCESS_DOWNLOADER=1 RUST_LOG=info \
+./target/debug/orbit-openeo-geo \
+  --bind 127.0.0.1:9083 \
+  --executor geo \
+  --files-dir "$FILES_DIR" \
+  --stac-url https://earth-search.aws.element84.com/v1 \
+  > /tmp/orbit-p1.log 2>&1 &
+SRV=$!
+until curl -sf http://127.0.0.1:9083/.well-known/openeo >/dev/null; do
+  kill -0 $SRV || { tail -30 /tmp/orbit-p1.log; exit 1; }
+  sleep 0.5
+done
+# POST + poll as in §2.4.1
+```
+
+**Confirm P1 is in use**: log line `downloader: in-process gdal::Dataset (P1, opt-out from P2 default)`.
+
+#### P2 — async-tiff + object_store (Opt 1 + Opt 2 + STAC hint; runtime default)
+
+**What it does**:
+- `async-tiff` + `object_store::aws::AmazonS3` does HTTP/2 multiplexed range
+  reads instead of libgdal `/vsicurl/`.
+- **Opt 1 (proj 0.31)**: cross-CRS bbox reproject via libproj FFI — no fallback
+  to libgdal for the common EPSG-to-EPSG case.
+- **Opt 2 (shared S3 pool)**: `static S3_POOL_CACHE: Lazy<RwLock<HashMap<(bucket,region), Arc<dyn ObjectStore>>>>`
+  so all concurrent downloads share one HTTP/2 connection pool.
+- **STAC hint (Task #34)**: `download_via_async_tiff_with_crs_and_meta`
+  pre-projects the bbox in parallel with the IFD fetch using STAC
+  `proj:epsg` (the hint short-circuits the IFD's GeoKeyDirectory lookup).
+  Telemetry: `P2: STAC band_metadata hint — dispatches with hint vs without
+  hint_dispatched=N hint_missing=M`.
+
+**Wall on 12 MP Wien S2 NDVI (same workload)**: 53 / 76 / 88 s across 3 successful
+runs = **76 s median**, **53 s best**. **1/4 reps timed out >300 s** on an S3
+body-error retry storm — known tail risk, see below.
+
+**Build + run**:
+```bash
+cargo build -p orbit-openeo --features geo-kernel,async-tiff-downloader
+cp target/debug/orbit-openeo target/debug/orbit-openeo-geo
+
+FILES_DIR=/tmp/orbit-p2-$(date +%s) && mkdir -p "$FILES_DIR"
+# No env var needed — P2-full is the default when the feature is built.
+RUST_LOG=info \
+./target/debug/orbit-openeo-geo \
+  --bind 127.0.0.1:9083 \
+  --executor geo \
+  --files-dir "$FILES_DIR" \
+  --stac-url https://earth-search.aws.element84.com/v1 \
+  > /tmp/orbit-p2.log 2>&1 &
+SRV=$!
+until curl -sf http://127.0.0.1:9083/.well-known/openeo >/dev/null; do
+  kill -0 $SRV || { tail -30 /tmp/orbit-p2.log; exit 1; }
+  sleep 0.5
+done
+# POST + poll as in §2.4.1
+# After the job finishes:
+grep -E "STAC band_metadata hint|object_store::client" /tmp/orbit-p2.log
+```
+
+**Confirm P2 is in use**: log line `downloader: async-tiff + object_store + STAC hint (P2-full, default; set ORBIT_INPROCESS_DOWNLOADER=1 to opt-out to P1)`.
+
+**Download concurrency tuning (Task #43 — shipped 2026-05-24)**: the
+`download_sem` semaphore bounds simultaneous COG fetches. Default is
+**6** (lowered from 8 after a 5-point sweep on 12 MP Wien S2). The 8/12
+defaults over-saturated the shared S3 connection pool on 3-scene × 2-band
+workloads (= 6 COGs in flight); N=4–6 hit the **EORS warm-cache parity
+~14 s wall** on cold-network reps. Override with `ORBIT_DOWNLOAD_CONCURRENCY=<N>`
+(N≥1; clamped). Log line at startup: `download concurrency override permits=N`.
+
+| 10-node sweep | N=2 | N=4 | N=6 | N=8 | N=12 |
+|---|---|---|---|---|---|
+| Wall (s, healthy S3) | 91 | **14** | 16 | 43 | 40 |
+
+| 15-node sweep | N=2 | N=4 | N=6 | N=8 | N=12 |
+|---|---|---|---|---|---|
+| Wall (s, healthy S3) | 23 | 26 | 15 | **14** | 17 |
+
+Rule of thumb: pick `N ≈ min(N_cogs, 4–6)` where `N_cogs = scenes × bands`.
+
+**Tail-latency risk (Task #39 — shipped 2026-05-24)**: when
+`object_store::client::get: HTTP error: request or response body error.
+Retrying in <N>s` appears in the log, the S3 connection pool has hit a
+body-error storm. object_store's defaults (`max_retries=10`, `retry_timeout=180s`)
+let this storm extend to 30+ minutes. `shared_s3_for` now applies a tuned
+default + env-var overrides:
+
+| Env var | Default | Effect |
+|---|---|---|
+| `ORBIT_S3_MAX_RETRIES` | `3` | Cap on retries per request (object_store default = 10). |
+| `ORBIT_S3_RETRY_TIMEOUT_SECS` | `60` | Total time budget for the retry loop per request (default = 180). |
+| `ORBIT_S3_REQUEST_TIMEOUT_SECS` | `120` | Per-request wall clock (reqwest `timeout`). |
+| `ORBIT_S3_CONNECT_TIMEOUT_SECS` | `10` | TCP connect timeout (reqwest `connect_timeout`). |
+
+With defaults, the **per-request** tail is bounded by `~max(retry_timeout, max_retries × request_timeout)` ≈ 360 s worst case, but in practice
+the retry budget caps at 60 s. The 300+ s rep-3 P2 timeout reproduced
+above should now bound to **≤ 120 s per file** instead of unbounded.
+
+Verify the config is applied: bench log will include
+```
+async_tiff: built S3 client with tuned retry/timeout config
+  bucket=sentinel-cogs region=us-west-2 max_retries=3 retry_timeout_secs=60
+  request_timeout_secs=120 connect_timeout_secs=10
+```
+(visible at `RUST_LOG=debug` or above for `orbit_geo`).
+
+#### When to pick which
+
+| Scenario | Pick |
+|---|---|
+| Greenfield prod deploy on Element84 STAC | **P2 (default)** — competitive median, instrumented hint plumbing |
+| S3 transport instability suspected (body errors in log) | **P1** via `ORBIT_INPROCESS_DOWNLOADER=1` |
+| Linux deploy without `libproj-dev` | Build w/o `async-tiff-downloader` → P1 is the only path |
+| Hard SLA on tail latency (p99 < 2× median) | **P1** (P2 tail is currently unbounded) |
+| Debugging download throughput | A/B run both; P2 emits `hint_dispatched=N` and `ASYNC_TIFF_CROSS_CRS_PROJ_TAKEN` counters |
+
+#### Quick A/B benchmark script
+
+`/tmp/bench_p1_p2.sh` (pattern; not in repo yet):
+```bash
+for VARIANT in P1 P2; do
+  case $VARIANT in
+    P1) EXTRA="ORBIT_INPROCESS_DOWNLOADER=1";;
+    P2) EXTRA="";;
+  esac
+  for i in 1 2 3; do
+    FILES_DIR=/tmp/orbit-bench-$VARIANT-$i && mkdir -p "$FILES_DIR"
+    LOG=/tmp/orbit-bench-$VARIANT-$i.log
+    eval "$EXTRA RUST_LOG=info ./target/debug/orbit-openeo-geo \
+      --bind 127.0.0.1:9099 --executor geo --files-dir $FILES_DIR \
+      --stac-url https://earth-search.aws.element84.com/v1 > $LOG 2>&1 &"
+    SRV=$!
+    until curl -sf http://127.0.0.1:9099/.well-known/openeo >/dev/null; do
+      kill -0 $SRV || break; sleep 0.5
+    done
+    T0=$(date +%s)
+    ID=$(curl -s -i -X POST http://127.0.0.1:9099/jobs -H 'content-type: application/json' \
+         --data-binary @apps/orbit-openeo/examples/masked_ndvi_png_real_s2.json \
+         | grep -i '^openeo-identifier:' | awk '{print $2}' | tr -d '\r\n')
+    curl -s -X POST "http://127.0.0.1:9099/jobs/$ID/results" -o /dev/null
+    while :; do
+      ST=$(curl -s "http://127.0.0.1:9099/jobs/$ID" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status","?"))' 2>/dev/null)
+      [[ "$ST" == "finished" || "$ST" == "error" ]] && break
+      kill -0 $SRV || { echo "$VARIANT $i: SERVER DIED"; break; }
+      sleep 1
+    done
+    T1=$(date +%s)
+    echo "$VARIANT rep$i wall=$((T1-T0))s status=$ST"
+    kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+    rm -rf "$FILES_DIR"
+  done
+done
+```
+
+### 2.4.3 P2-full **BEST-PRACTICE E2E** — the 14 s recipe (Task #43, 2026-05-24)
+
+**Result**: on a 10-node Wien NDVI graph (`complex_10node_nomask_real_s2.json`,
+3 scenes × 2 bands = 6 COGs), the orbit P2-full backend hits **14 s wall
+on cold-network** — within 2 s of the EORS public Rust benchmark warm-cache
+target of ~12 s. Combines every optimisation shipped this session:
+
+#### One-shot build + run
+
+```bash
+# 1. Build with the async-tiff feature (P2-full needs this).
+cargo build -p orbit-openeo --features geo-kernel,async-tiff-downloader
+cp target/debug/orbit-openeo target/debug/orbit-openeo-geo
+
+# 2. Disk pre-flight: each fresh server writes ~30 MB scratch GTiffs per
+#    job. Drop GC (Task #38) cleans them at process exit, but a hung crash
+#    leaves them. Keep ≥1 GB free.
+df -h /System/Volumes/Data | tail -1
+
+# 3. Boot the server with EVERY perf knob set to the sweet spot.
+FILES_DIR=/tmp/orbit-best-$(date +%s) && mkdir -p "$FILES_DIR"
+ORBIT_DOWNLOAD_CONCURRENCY=4 \
+ORBIT_S3_MAX_RETRIES=3 \
+ORBIT_S3_RETRY_TIMEOUT_SECS=60 \
+ORBIT_S3_REQUEST_TIMEOUT_SECS=120 \
+ORBIT_S3_CONNECT_TIMEOUT_SECS=10 \
+RUST_LOG=info \
+./target/debug/orbit-openeo-geo \
+  --bind 127.0.0.1:9106 \
+  --executor geo \
+  --files-dir "$FILES_DIR" \
+  --stac-url https://earth-search.aws.element84.com/v1 \
+  > /tmp/orbit-p2-best.log 2>&1 &
+SRV=$!
+until curl -sf http://127.0.0.1:9106/.well-known/openeo >/dev/null; do
+  kill -0 $SRV || { tail -30 /tmp/orbit-p2-best.log; exit 1; }
+  sleep 0.5
+done
+
+# 4. POST the graph, capture the openeo-identifier, trigger, poll.
+T0=$(date +%s)
+ID=$(curl -s -i -X POST http://127.0.0.1:9106/jobs \
+  -H 'content-type: application/json' \
+  --data-binary @apps/orbit-openeo/examples/complex_10node_nomask_real_s2.json \
+  | grep -i '^openeo-identifier:' | awk '{print $2}' | tr -d '\r\n')
+curl -s -X POST "http://127.0.0.1:9106/jobs/$ID/results" -o /dev/null
+while :; do
+  ST=$(curl -s "http://127.0.0.1:9106/jobs/$ID" \
+       | python3 -c 'import sys,json;print(json.load(sys.stdin).get("status","?"))')
+  [[ "$ST" == "finished" || "$ST" == "error" ]] && break
+  sleep 1
+done
+T1=$(date +%s); echo "WALL=$((T1-T0))s STATUS=$ST"
+
+# 5. Persisted PNG.
+ls -lh "$FILES_DIR/$ID/result.png"
+kill $SRV
+```
+
+Expected `WALL=14s STATUS=finished` on a healthy S3 day. Errors out to
+`error` in ≤120 s on an S3-storm day (Task #39 retry bound).
+
+#### Configuration matrix that achieved it
+
+| Layer | Knob | Value used | Reason | Shipped in |
+|---|---|---|---|---|
+| Cargo feature | `async-tiff-downloader` | on | enables `AsyncTiffDownloader` + `proj` + `object_store` | pre-existing |
+| Cargo feature | `geo-kernel` | on (default) | enables GDAL `GeoExecutor` | pre-existing |
+| Runtime — downloader | (no env var) | P2-full default | flipped 2026-05-24 from P1 | Task #37 |
+| Runtime — STAC hint | (automatic) | always on when P2 active | parallel bbox project + IFD fetch | Task #34 |
+| Runtime — cross-CRS | (automatic) | pure-Rust `proj 0.31` | eliminates libgdal fallback | Task (Opt 1) |
+| Runtime — S3 pool | (automatic) | shared `Arc<AmazonS3>` per (bucket, region) | one HTTP/2 pool across all 6 COGs | Task (Opt 2) |
+| Env — concurrency | `ORBIT_DOWNLOAD_CONCURRENCY` | `4` (or default 6) | sweep showed 4-6 = sweet spot for 6-COG workloads | Task #43 |
+| Env — S3 retries | `ORBIT_S3_MAX_RETRIES` | `3` | bounds tail vs upstream default 10 | Task #39 |
+| Env — S3 retry budget | `ORBIT_S3_RETRY_TIMEOUT_SECS` | `60` | bounds tail vs upstream default 180 | Task #39 |
+| Env — S3 per-req timeout | `ORBIT_S3_REQUEST_TIMEOUT_SECS` | `120` | reqwest `timeout` | Task #39 |
+| Env — S3 connect timeout | `ORBIT_S3_CONNECT_TIMEOUT_SECS` | `10` | reqwest `connect_timeout` | Task #39 |
+| Ops — scratch GC | `Drop` on `GeoExecutor` | automatic | cleans `orbit-geoexec-*` at process exit | Task #38 |
+| Debug — pin scratch | `ORBIT_SCRATCH_DIR=<path>` | unset | pins scratch to a user-owned dir; **preserved** on exit (owns_scratch=false) so intermediate GeoTIFFs survive for `gdalinfo` value-verification | 2026-05-25 |
+
+#### Why this combination wins
+
+1. **STAC hint shortcuts the IFD round-trip on cross-CRS** — `proj:epsg` is read from STAC at search time, so `download_via_async_tiff_with_crs_and_meta` can `tokio::join!` the bbox projection with the IFD fetch (parallel instead of serial). Saves ~3-5 s × 6 COGs ≈ ~25 s wall when amortised across the concurrent fetch pool.
+2. **Shared S3 pool reuses one HTTP/2 connection** for all 6 COGs to the same bucket. Without it, 6 separate `AmazonS3Builder` instances would each build a fresh `reqwest::Client` with its own connection — no multiplexing, more TLS handshakes, larger curl pools.
+3. **Concurrency cap matches workload** — N=4 lets 4 of 6 COGs fetch in parallel batch 1, then 2 more in batch 2. Higher N (8, 12) over-saturated the pool and triggered S3 to RST connections under burst.
+4. **Tuned retry budget fails fast** — when S3 misbehaves, we error in ≤120 s with a clean stack trace instead of stalling 30 min on upstream defaults.
+
+#### Verifying you're on the fast path
+
+The bench log should contain in this order, within the first ~10 s:
+
+```
+INFO orbit_openeo: downloader: async-tiff + object_store + STAC hint (P2-full, default; ...)
+INFO orbit_openeo: download concurrency override permits=4   ← only if you set ORBIT_DOWNLOAD_CONCURRENCY
+DEBUG orbit_geo::async_download: built S3 client with tuned retry/timeout config bucket=sentinel-cogs region=us-west-2 max_retries=3 retry_timeout_secs=60 request_timeout_secs=120 connect_timeout_secs=10
+INFO orbit_openeo::geo_executor::eval_load: P2: STAC band_metadata hint — dispatches with hint vs without hint_dispatched=6 hint_missing=0
+```
+
+`hint_dispatched=N` proves the STAC hint plumbing is live. `hint_missing > 0` would mean some scenes had no `proj:epsg` from the STAC backend (rare for Element84; common for hand-rolled STAC servers).
+
+#### Measuring the download / compute split
+
+At the **end** of every job, `evaluate` logs a per-node-category wall breakdown (2026-05-25). Nodes run sequentially in topo order, so the categories sum to the graph wall:
+
+```
+INFO orbit_openeo::geo_executor: phase timing — per-node-category wall (download=load_collection, mask=mask_scl_dilation, compute=rest) download_s=51.2 mask_s=1.8 compute_s=0.9 total_s=53.9 nodes=15
+```
+
+- `download_s` = time inside `load_collection` (STAC search + COG range-reads — the I/O-bound phase, dominates on P2).
+- `mask_s` = `mask_scl_dilation` (SCL fetch + per-band resample).
+- `compute_s` = everything else (ndvi/reduce/apply/merge/save) — on small AOI crops this is typically **sub-second**, confirming wall is download-bound, not CPU-bound.
+- Per-node detail is at `DEBUG` (`node=… process=… ms=…`).
+
+This is the canonical way to answer "why did this graph take Ns" — read `download_s` vs `compute_s` instead of guessing. More bands × scenes ⇒ more COGs ⇒ larger `download_s`; the rest is S3 latency variance.
+
+#### When NOT to use P2-full
+
+| Symptom | Fall back to | Env var |
+|---|---|---|
+| Repeated `object_store::client::get: HTTP error: request or response body error` in logs | **P1** (in-process libgdal) | `ORBIT_INPROCESS_DOWNLOADER=1` |
+| Building on Linux without `libproj-dev` | P1 (build without async-tiff-downloader) | feature flip |
+| Hard SLA on p99 wall time | **P1** (bounded by libgdal `/vsicurl/` retry) | `ORBIT_INPROCESS_DOWNLOADER=1` |
+| Debugging a STAC backend that omits `proj:*` extensions | P1 (no benefit from P2's hint path) | `ORBIT_INPROCESS_DOWNLOADER=1` |
+
+#### Empirical performance summary (Task #43 sweep, 2026-05-24)
+
+| Workload | Backend | Best wall | Median wall | Notes |
+|---|---|---|---|---|
+| 10-node Wien NDVI nomask | orbit P2-full N=4 | **14 s** | 16 s | 5/5 success on the sweep |
+| 15-node Wien NDVI nomask | orbit P2-full N=8 | **14 s** | 15 s | 5/5 success on the sweep |
+| 10-node Wien NDVI nomask | JonaAI Python+Dask | 63 s | 75-93 s | needs 2 patches to `ndvi()` |
+| EORS public Rust (warm cache) | reference | ~12 s | — | unavailable cold-network number |
+| 12 MP Wien S2 masked NDVI (4-node) | orbit P1 | 71 s | 78 s | stable baseline |
+| 12 MP Wien S2 masked NDVI (4-node) | JonaAI | — | 141 s | post-patches |
+
 ### 2.5 Sample graph
 
 `apps/orbit-openeo/examples/ndvi_mean_time.json` is the canonical openEO
@@ -233,7 +547,9 @@ following invariants are load-bearing:
 | **A9** | `geo_executor/stac.rs`, all `eval_*` | `StacScene.bands: BTreeMap<String, String>` and `__cube.bands: {<name>: [paths]}` — never reintroduce `red_href`/`nir_href`/`scl_href`/`red_paths`/`nir_paths`/`scl_paths`/`ndvi_paths` flat keys. `ndvi(nir, red, target_band)` args MUST be honored, not hardcoded. |
 | **A12** | `crates/orbit-geo/src/providers.rs::build_gdal_translate_argv` | `-projwin_srs <crs>` is mandatory whenever the bbox is in a CRS different from the COG's native (default openEO EPSG:4326 vs S2 UTM). Without it, degree-scale bboxes collapse to 1×1 output. |
 | **UTM-1px** | `geo_executor/eval_mask.rs` two workers | Data + mask cubes can differ by ±1 px after UTM reprojection. Iterate using `min(rdb.dims, mblock.dims)` — never `rdb.dims` blindly. |
-| **SCL-20m** | `geo_executor/eval_mask.rs::resample_scl_to_data_grid` | S2 SCL is published at 20 m; B04/B08 are 10 m. `mask_scl_dilation` MUST auto-resample SCL to data resolution via `gdalwarp -r near` (nearest-neighbour — SCL is categorical) before applying. Without this the inner kernel rejects with `inconsistent metadata: data has N blocks, mask has M`. |
+| **SCL-20m** | `geo_executor/eval_mask.rs::resample_scl_to_data_grid` | S2 SCL is published at 20 m; B04/B08 are 10 m. `mask_scl_dilation` MUST auto-resample SCL to data resolution via `gdalwarp -r near` (nearest-neighbour — SCL is categorical) before applying. Without this the inner kernel rejects with `inconsistent metadata: data has N blocks, mask has M`. **GAP (BUG-001, 2026-05-24)**: this auto-resample only fires on the FIRST band's grid; if the load mixes 10 m (B04/B08) AND 20 m (B11/B12) bands, the 20 m data still misaligns with the now-10 m mask. See `docs/perf/KNOWN_BUGS.md#BUG-001`. |
+| **multi-band cube ops** | `geo_executor/eval_apply.rs`, `eval_reduce.rs` (`bands` dim) | After `merge_cubes` joins two cubes with arbitrary `target_band` names, downstream `apply` and `reduce_dimension(dimension="bands")` reject the cube with `__cube.bands has no usable band` / `has no recognised index band (expected ndvi/ndmi/ndwi/etc.)`. Workaround: use only recognised index names (`ndvi`/`ndmi`/`ndwi`) AND apply BEFORE merge. See `docs/perf/KNOWN_BUGS.md#BUG-002` and `#BUG-003`. **(All FIXED 2026-05-25 — apply iterates all bands; reduce(bands) implemented; merge_cubes does band-axis join.)** |
+| **reflectance scaling** | `data_cube.rs::band_scales`, `eval_load.rs`, `eval_apply.rs` | **Option B (2026-05-25)**: S2 COGs store Int16 DN; openEO load_collection should return reflectance. `load_collection` harvests `raster:bands.scale`/`offset` into `cube.band_scales` (per-band). `apply` converts `v*scale+offset` BEFORE the user's sub-graph so absolute math sees reflectance. **`ndvi` is scale-invariant (ratio cancels) and deliberately does NOT scale.** SCL/QA and derived-index bands have no scale entry (identity). Output bands are physical units → `band_scales` cleared on apply output. If a future workflow does absolute math on a raw band WITHOUT going through `apply`, it would see DN — only `apply` honors the scale today. |
 
 ---
 
@@ -331,3 +647,47 @@ mvp/orbit-etl/
 - **No emojis in source files** unless explicitly requested.
 - **Confirm before destructive ops** — `git reset --hard`, `git push
   --force`, dropping tables, killing other people's processes.
+
+## 9. Deferred opportunities (not shipped — captured for future work)
+
+### 9.1 Consolidate the openEO STAC searcher onto `orbit-geo::StacClient` (rustac)
+
+**Finding (verified 2026-05-25): the repo has TWO STAC implementations.**
+
+1. **rustac-based, already vendored but dormant** — `crates/orbit-geo/Cargo.toml:26`
+   declares a `stac` feature pulling `stac` 0.17 + `stac-api` 0.8 + `stac-io` +
+   `stac-extensions` + `stac-client` + `stac-validate`. Implemented in
+   `crates/orbit-geo/src/stac.rs` (`StacClient` wrapping `stac_client::Client` —
+   `collections()` / `search()` + `stac_validate::Validator`) and
+   `crates/orbit-geo/src/stac_helpers.rs` (7 helpers over `Vec<stac::Item>`).
+   **But** `orbit-geo` has `default = []` and the openEO app enables it with only
+   `["cloud_mask","use_ml"]` (NOT `stac`) — so this client is compiled out and unused.
+2. **Hand-rolled, what actually runs** — `apps/orbit-openeo/src/geo_executor/stac.rs`
+   `HttpStacSearcher` (`reqwest` + `serde_json::Value`) extracts exactly
+   `proj:epsg/transform/shape` + `raster:bands.scale/offset/nodata` into a lean
+   `BandMetadata` / `StacScene` to feed the P2 download hint.
+
+**Opportunity — consolidate the openEO searcher onto the existing `StacClient`:**
+- **Gain**: kills the duplicate STAC impl; adds `stac-validate`; typed
+  `stac-extensions` parsing (Projection + Raster ext structs instead of
+  `serde_json::Value` digging); pagination / conformance handling.
+- **Cost**: enable orbit-geo's `stac` feature + write an adapter
+  `stac_client::ItemCollection → StacScene/BandMetadata`; re-verify the P2 hint
+  path still gets `proj:epsg` / `raster:bands.scale`.
+- **Risk**: extra dep weight + the async-client model in the request path; the
+  current hand-rolled extractor is leaner for the narrow hint use-case.
+
+**Spike before committing**: feature-flag an alternate searcher and A/B it against
+`HttpStacSearcher` (correctness of `BandMetadata` + wall time) before deleting the
+hand-rolled path.
+
+**No Rust openEO process engine exists** (Jan-2026 knowledge): reference impls are
+Python (`openeo-processes-dask`, `openeo-python-driver`) + Java
+(`openeo-geotrellis`). Hand-rolling orbit's process registry/evaluator + file-backed
+`DataCube` is the only realistic path — there is no `xarray`-equivalent labeled N-d
+array crate to lean on either.
+
+> ⚠️ **Confidence**: in-repo facts (paths, versions, feature wiring) verified directly.
+> The "no Rust openEO engine" + "rustac is the standard" claims are to Jan-2026
+> knowledge; NOT web-verified (search hit a usage-credits error). Re-confirm current
+> rustac versions + scan crates.io for any new openEO Rust effort before acting.

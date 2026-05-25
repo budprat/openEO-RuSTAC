@@ -1,0 +1,299 @@
+{
+  "process": {
+    "process_graph": {
+      "load1": {
+        "process_id": "load_collection",
+        "arguments": {
+          "id": "sentinel-2-l2a",
+          "spatial_extent": {
+            "west": 16.3,
+            "south": 48.18,
+            "east": 16.4,
+            "north": 48.24
+          },
+          "temporal_extent": [
+            "2024-06-01",
+            "2024-06-30"
+          ],
+          "bands": [
+            "B04",
+            "B08",
+            "B11",
+            "B12",
+            "SCL"
+          ]
+        }
+      },
+      "mask1": {
+        "process_id": "mask_scl_dilation",
+        "arguments": {
+          "data": {
+            "from_node": "load1"
+          }
+        }
+      },
+      "ndvi_a": {
+        "process_id": "ndvi",
+        "arguments": {
+          "data": {
+            "from_node": "mask1"
+          },
+          "nir": "B08",
+          "red": "B04",
+          "target_band": "ndvi"
+        }
+      },
+      "apply_a1": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "ndvi_a"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "multiply",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 100.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply_a2": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply_a1"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "add",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 0.5
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "reduce_a": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": {
+            "from_node": "apply_a2"
+          },
+          "dimension": "t",
+          "reducer": {
+            "process_graph": {
+              "r": {
+                "process_id": "mean",
+                "arguments": {
+                  "data": {
+                    "from_parameter": "data"
+                  }
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply_a3": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "reduce_a"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "absolute",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  }
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "ndvi_b": {
+        "process_id": "ndvi",
+        "arguments": {
+          "data": {
+            "from_node": "mask1"
+          },
+          "nir": "B12",
+          "red": "B11",
+          "target_band": "ndmi"
+        }
+      },
+      "apply_b1": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "ndvi_b"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "multiply",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 100.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply_b2": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "apply_b1"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "absolute",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  }
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "reduce_b": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": {
+            "from_node": "apply_b2"
+          },
+          "dimension": "t",
+          "reducer": {
+            "process_graph": {
+              "r": {
+                "process_id": "max",
+                "arguments": {
+                  "data": {
+                    "from_parameter": "data"
+                  }
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "apply_b3": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "reduce_b"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "subtract",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 0.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "merge1": {
+        "process_id": "merge_cubes",
+        "arguments": {
+          "cube1": {
+            "from_node": "apply_a3"
+          },
+          "cube2": {
+            "from_node": "apply_b3"
+          }
+        }
+      },
+      "apply_m": {
+        "process_id": "apply",
+        "arguments": {
+          "data": {
+            "from_node": "merge1"
+          },
+          "process": {
+            "process_graph": {
+              "p": {
+                "process_id": "divide",
+                "arguments": {
+                  "x": {
+                    "from_parameter": "x"
+                  },
+                  "y": 2.0
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      },
+      "save1": {
+        "process_id": "save_result",
+        "arguments": {
+          "data": {
+            "from_node": "reduce_final"
+          },
+          "format": "PNG"
+        },
+        "result": true
+      },
+      "reduce_final": {
+        "process_id": "reduce_dimension",
+        "arguments": {
+          "data": {
+            "from_node": "apply_m"
+          },
+          "dimension": "bands",
+          "reducer": {
+            "process_graph": {
+              "r": {
+                "process_id": "mean",
+                "arguments": {
+                  "data": {
+                    "from_parameter": "data"
+                  }
+                },
+                "result": true
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "title": "Wien diamond \u2014 full path with BUG-004 reduce(bands) post-merge"
+}

@@ -62,6 +62,8 @@ pub(super) fn paths_to_value(paths: &[PathBuf]) -> Value {
 
 mod download;
 mod eval_apply;
+mod eval_arrays;
+mod eval_cube_ops;
 mod eval_load;
 mod eval_mask;
 mod eval_mask_from_values;
@@ -83,7 +85,7 @@ pub use download::AsyncTiffDownloader;
 pub use eval_load::parse_eo_cloud_cover_lt;
 pub use eval_reduce::{apply_reducer, parse_reducer_subgraph, Reducer};
 pub use registry::{register_defaults, ProcessHandler, ProcessRegistry};
-pub use stac::{HttpStacSearcher, StacScene, StacSearcher};
+pub use stac::{BandMetadata, HttpStacSearcher, StacScene, StacSearcher};
 
 // ---------------------------------------------------------------------
 // GeoExecutor
@@ -99,6 +101,12 @@ pub struct GeoExecutor {
     /// no-op signer so public-bucket backends like Element84 just work.
     pub(super) signer: Arc<dyn AssetSigner>,
     pub(super) scratch_dir: PathBuf,
+    /// **Task #38 hardening** — when `true`, [`Drop`] removes
+    /// `scratch_dir` recursively at process shutdown. Set by [`Self::new`]
+    /// for the auto-created `orbit-geoexec-*` temp dir; cleared by
+    /// [`Self::with_scratch_dir`] when the caller supplies their own path
+    /// (so we don't `rm -rf` a user-owned directory).
+    pub(super) owns_scratch: bool,
     /// Content-addressed cache between downloader and dataset builder.
     /// When set, repeat-queries on identical asset URLs hit the cache and
     /// skip the network entirely — the explicit block-parallel speedup vehicle.
@@ -108,7 +116,12 @@ pub struct GeoExecutor {
     /// Pixel offset of the crop window (top-left).
     pub(super) crop_offset: u32,
     /// **P0-5 / P1-9**: bounded concurrency on `gdal_translate` spawns.
-    /// Default 8; configurable via `with_download_concurrency`.
+    /// Default **6** (lowered from 8 on 2026-05-24 after the Task #43
+    /// semaphore sweep showed N=8/12 over-saturated the shared S3 pool
+    /// on 3-scene × 2-band workloads, while N=4/6 hit the EORS warm-cache
+    /// parity number ~14 s on cold-network reps).
+    /// Configurable via [`Self::with_download_concurrency`] or the
+    /// `ORBIT_DOWNLOAD_CONCURRENCY` env var (see `apps/orbit-openeo/src/main.rs`).
     pub(super) download_sem: std::sync::Arc<tokio::sync::Semaphore>,
     /// **P1-7**: SSRF policy applied to STAC + asset URLs before any
     /// network call. Default denies http, RFC1918, IMDS, loopback,
@@ -142,10 +155,11 @@ impl GeoExecutor {
             downloader: Arc::new(GdalTranslateDownloader),
             signer: Arc::new(NoopAssetSigner),
             scratch_dir: scratch,
+            owns_scratch: true,
             cache: None,
             crop_size: 256,
             crop_offset: 0,
-            download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(8)),
+            download_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(6)),
             url_policy: crate::url_policy::UrlPolicy::default(),
             registry,
         }
@@ -214,10 +228,13 @@ impl GeoExecutor {
     }
 
     /// Override the scratch directory (cache root + intermediate GeoTIFFs).
+    /// **Task #38**: clears the auto-cleanup flag so the supplied dir is
+    /// preserved on shutdown (it's user-owned).
     #[must_use]
     pub fn with_scratch_dir(mut self, dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
         self.scratch_dir = dir;
+        self.owns_scratch = false;
         self
     }
 
@@ -249,6 +266,16 @@ impl GeoExecutor {
             .map_err(|e| ExecError::InvalidGraph(e.to_string()))?;
         let order = analysis.evaluation_order();
         let mut memo: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+        // **Phase timing (2026-05-25)**: nodes execute sequentially in topo
+        // order, so accumulating each node-handler's wall time by category
+        // gives an exact download / mask / compute split for the whole job.
+        // Logged once at INFO after the walk. The heavy I/O (COG range-reads)
+        // lives in `load_collection`; SCL resample in `mask_scl_dilation`;
+        // everything else (reduce/apply/merge/ndvi/save) is "compute".
+        let eval_t0 = std::time::Instant::now();
+        let mut t_download = std::time::Duration::ZERO;
+        let mut t_mask = std::time::Duration::ZERO;
+        let mut t_compute = std::time::Duration::ZERO;
         for node_id in &order {
             let node = graph
                 .nodes
@@ -264,13 +291,38 @@ impl GeoExecutor {
             // inside `ApplyHandler`, save_result envelope inside
             // `SaveResultHandler`).
             let process_name = node.process_id.0.as_str();
-            let handler = self
-                .registry
-                .get(process_name)
-                .ok_or_else(|| ExecError::UnknownProcess(process_name.into()))?;
+            let handler = self.registry.get(process_name).ok_or_else(|| {
+                // did-you-mean (2026-05-25): append nearest registered
+                // process names to the error for a better client UX.
+                let hints = self.registry.suggest(process_name, 3);
+                if hints.is_empty() {
+                    ExecError::UnknownProcess(process_name.into())
+                } else {
+                    ExecError::UnknownProcess(format!(
+                        "{process_name} (did you mean: {})",
+                        hints.join(", ")
+                    ))
+                }
+            })?;
+            let node_t0 = std::time::Instant::now();
             let out = handler.handle(self, resolved_args).await?;
+            let dt = node_t0.elapsed();
+            match process_name {
+                "load_collection" => t_download += dt,
+                "mask_scl_dilation" | "mask" => t_mask += dt,
+                _ => t_compute += dt,
+            }
+            tracing::debug!(node = %node_id, process = process_name, ms = dt.as_millis() as u64, "node done");
             memo.insert(node_id.clone(), out);
         }
+        tracing::info!(
+            download_s = t_download.as_secs_f64(),
+            mask_s = t_mask.as_secs_f64(),
+            compute_s = t_compute.as_secs_f64(),
+            total_s = eval_t0.elapsed().as_secs_f64(),
+            nodes = order.len(),
+            "phase timing — per-node-category wall (download=load_collection, mask=mask_scl_dilation, compute=rest)"
+        );
         let result = memo
             .remove(&analysis.result_id)
             .ok_or_else(|| ExecError::InvalidGraph("result node was not visited during topo walk".into()))?;
@@ -327,6 +379,26 @@ impl GeoExecutor {
         crop: CropWindow,
         crop_crs: Option<String>,
     ) -> Result<PathBuf, ExecError> {
+        self.fetch_with_cache_async_with_meta(href, dst, crop, crop_crs, None).await
+    }
+
+    /// **Task #34** — hint-aware variant of [`Self::fetch_with_cache_async`].
+    /// Callers that have STAC `proj:*` + `raster:bands.*` metadata may pass
+    /// it via `hint` so the [`AsyncTiffDownloader`] (when active) can skip
+    /// IFD round-trips or parallelise bbox projection with the IFD fetch.
+    /// Other downloader impls ignore the hint via the trait's default impl.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn fetch_with_cache_async_with_meta(
+        &self,
+        href: String,
+        dst: PathBuf,
+        crop: CropWindow,
+        crop_crs: Option<String>,
+        #[cfg(feature = "async-tiff-downloader")] hint: Option<
+            orbit_geo::providers::BandMetadataHint,
+        >,
+        #[cfg(not(feature = "async-tiff-downloader"))] _hint: Option<()>,
+    ) -> Result<PathBuf, ExecError> {
         // **P1-7**: SSRF check before any DNS / network work.
         self.url_policy
             .check(&href)
@@ -352,12 +424,25 @@ impl GeoExecutor {
         let blocking_result = tokio::task::spawn_blocking(move || -> Result<PathBuf, ExecError> {
             let _permit = permit; // released when this closure returns
             let signed = signer.sign(&h_for_blocking)?;
-            downloader.download(
-                &signed,
-                &dst_for_blocking,
-                crop,
-                crop_crs.as_deref(),
-            )?;
+            #[cfg(feature = "async-tiff-downloader")]
+            {
+                downloader.download_with_meta(
+                    &signed,
+                    &dst_for_blocking,
+                    crop,
+                    crop_crs.as_deref(),
+                    hint.as_ref(),
+                )?;
+            }
+            #[cfg(not(feature = "async-tiff-downloader"))]
+            {
+                downloader.download(
+                    &signed,
+                    &dst_for_blocking,
+                    crop,
+                    crop_crs.as_deref(),
+                )?;
+            }
             if let Some(cache) = cache {
                 return cache
                     .insert(&h_for_blocking, &dst_for_blocking)
@@ -372,8 +457,14 @@ impl GeoExecutor {
         blocking_result
     }
 
-    /// Configure the maximum number of concurrent download (gdal_translate)
-    /// subprocesses. Default 8.
+    /// Configure the maximum number of concurrent COG download permits
+    /// (passed to the active [`Downloader`] via the semaphore).
+    /// **Default 6** (Task #43 sweep, 2026-05-24): higher values
+    /// over-saturated the shared `object_store` connection pool on
+    /// typical 3-scene × 2-band S2 workloads and triggered S3 body-error
+    /// retries; N=4–6 hit ~14 s wall on cold-network, parity with the
+    /// EORS warm-cache 12 s target. Overridable at runtime via
+    /// `ORBIT_DOWNLOAD_CONCURRENCY=<N>` env var (see `main.rs`).
     #[must_use]
     pub fn with_download_concurrency(mut self, permits: usize) -> Self {
         self.download_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(permits.max(1)));
@@ -392,6 +483,54 @@ impl GeoExecutor {
 
 impl Default for GeoExecutor {
     fn default() -> Self { Self::new() }
+}
+
+/// **Task #38 hardening** — auto-cleanup of the auto-created
+/// `orbit-geoexec-*` scratch directory at executor drop. Skipped when
+/// the caller supplied an external scratch path via
+/// [`GeoExecutor::with_scratch_dir`] (we never `rm -rf` a user-owned dir).
+/// Errors are logged at warn level and otherwise swallowed — we don't
+/// want shutdown to panic on a missing dir or permission glitch.
+impl Drop for GeoExecutor {
+    fn drop(&mut self) {
+        if !self.owns_scratch {
+            return;
+        }
+        if self.scratch_dir.as_os_str().is_empty() {
+            return;
+        }
+        // Defence-in-depth: only delete dirs whose final component matches
+        // the `orbit-geoexec-*` naming convention. If someone has mutated
+        // `scratch_dir` to point at `/` or `/Users` we refuse to delete.
+        let is_orbit_scratch = self
+            .scratch_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("orbit-geoexec-"))
+            .unwrap_or(false);
+        if !is_orbit_scratch {
+            tracing::warn!(
+                path = %self.scratch_dir.display(),
+                "GeoExecutor::drop: refusing to clean scratch_dir -- name doesn't match orbit-geoexec-*"
+            );
+            return;
+        }
+        match std::fs::remove_dir_all(&self.scratch_dir) {
+            Ok(()) => {
+                tracing::debug!(
+                    path = %self.scratch_dir.display(),
+                    "GeoExecutor::drop: cleaned scratch_dir"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // already gone
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.scratch_dir.display(), err = %e,
+                    "GeoExecutor::drop: failed to clean scratch_dir"
+                );
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -534,12 +673,67 @@ pub(super) fn extract_raster_path(v: Option<&Value>, name: &str) -> Result<PathB
         return serde_json::from_value(raster["path"].clone())
             .map_err(|e| ExecError::InvalidGraph(format!("{name}: bad __raster.path: {e}")));
     }
+    // BUG-003 follow-on (2026-05-24): also accept __cube envelopes by
+    // picking the primary band's first scene path. Lets `merge_cubes`
+    // consume the output of `apply` (which returns __cube). Preference
+    // matches the apply/reduce band-picker contract: index-band first,
+    // else first non-SCL band.
+    if let Some(cube) = v.get("__cube") {
+        if let Some(bands) = cube.get("bands").and_then(|b| b.as_object()) {
+            const F32_INDEX_BANDS: &[&str] = &["ndvi", "ndmi", "ndwi", "evi", "savi", "msavi"];
+            let pick_key: Option<String> = F32_INDEX_BANDS
+                .iter()
+                .find(|k| bands.contains_key(**k))
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    bands.keys().find(|k| k.as_str() != "SCL").cloned()
+                });
+            if let Some(key) = pick_key {
+                if let Some(paths) = bands.get(&key).and_then(|p| p.as_array()) {
+                    if let Some(first) = paths.first().and_then(|p| p.as_str()) {
+                        return Ok(PathBuf::from(first));
+                    }
+                }
+            }
+            return Err(ExecError::InvalidGraph(format!(
+                "{name}: __cube has no usable band path"
+            )));
+        }
+    }
     if let Some(s) = v.as_str() {
         return Ok(PathBuf::from(s));
     }
     Err(ExecError::InvalidGraph(format!(
-        "{name} must be a __raster handle or a string path"
+        "{name} must be a __raster handle, __cube envelope, or a string path"
     )))
+}
+
+/// **BUG-003 follow-on (2026-05-24)**: extract a file path from EITHER a
+/// `__raster` envelope OR a `__cube` envelope (picking the primary
+/// non-SCL band's first scene). Returns `None` if neither shape is
+/// present or the cube has no usable band. Used by
+/// [`finalise_save_result`] to render apply/reduce output via the PNG
+/// or GeoTIFF path instead of falling back to the 1×1 scalar stub.
+pub(super) fn extract_save_path(v: &Value) -> Option<PathBuf> {
+    if let Some(raster) = v.get("__raster") {
+        return raster
+            .get("path")
+            .and_then(|p| p.as_str())
+            .map(PathBuf::from);
+    }
+    if let Some(cube) = v.get("__cube") {
+        let bands = cube.get("bands")?.as_object()?;
+        const F32_INDEX_BANDS: &[&str] = &["ndvi", "ndmi", "ndwi", "evi", "savi", "msavi"];
+        let pick_key = F32_INDEX_BANDS
+            .iter()
+            .find(|k| bands.contains_key(**k))
+            .map(|s| s.to_string())
+            .or_else(|| bands.keys().find(|k| k.as_str() != "SCL").cloned())?;
+        let paths = bands.get(&pick_key)?.as_array()?;
+        let first = paths.first()?.as_str()?;
+        return Some(PathBuf::from(first));
+    }
+    None
 }
 
 fn deterministic_hash(v: &Value) -> u64 {
@@ -629,9 +823,10 @@ async fn finalise_save_result(value: Value) -> Result<SyncResult, ExecError> {
     match format {
         OutputFormat::Json => Ok(SyncResult::json(&data)),
         OutputFormat::GTiff | OutputFormat::Cog | OutputFormat::NetCdf => {
-            if let Some(raster) = data.get("__raster") {
-                let path: PathBuf = serde_json::from_value(raster["path"].clone())
-                    .map_err(|e| ExecError::Backend(format!("save_result: bad path: {e}")))?;
+            // BUG-003 follow-on (2026-05-24): accept __raster OR __cube
+            // envelopes — apply/reduce both return __cube and downstream
+            // save_result needs to find the actual file path.
+            if let Some(path) = extract_save_path(&data) {
                 let bytes = std::fs::read(&path).map_err(|e| {
                     ExecError::Backend(format!("save_result: read {}: {e}", path.display()))
                 })?;
@@ -642,9 +837,8 @@ async fn finalise_save_result(value: Value) -> Result<SyncResult, ExecError> {
             Ok(SyncResult { content_type: format.media_type().to_string(), body: bytes })
         }
         OutputFormat::Png => {
-            if let Some(raster) = data.get("__raster") {
-                let path: PathBuf = serde_json::from_value(raster["path"].clone())
-                    .map_err(|e| ExecError::Backend(format!("save_result: bad path: {e}")))?;
+            // BUG-003 follow-on: accept __raster OR __cube envelopes.
+            if let Some(path) = extract_save_path(&data) {
                 // GDAL is blocking — route through spawn_blocking per
                 // CLAUDE.md §4 P0-5. Reads the TIFF, dynamic-range stretches
                 // to 8-bit grayscale, encodes via GDAL's PNG driver.
@@ -913,6 +1107,37 @@ pub(super) mod tests {
 
     fn graph(args: serde_json::Value) -> serde_json::Value {
         json!({ "process": { "process_graph": args } })
+    }
+
+    // ---------- ORBIT_SCRATCH_DIR hook: with_scratch_dir preserve-on-drop ----------
+
+    #[test]
+    fn with_scratch_dir_preserves_user_dir_on_drop() {
+        // The ORBIT_SCRATCH_DIR env hook (main.rs) relies on this contract:
+        // a user-supplied scratch dir must NOT be deleted by GeoExecutor::drop
+        // (owns_scratch=false), so intermediate GeoTIFFs survive job completion
+        // for value-verification (gdalinfo). The default tempdir (owns_scratch=
+        // true, name `orbit-geoexec-*`) IS cleaned on drop — see the Drop impl.
+        let dir = std::env::temp_dir().join(format!(
+            "orbit-scratch-hook-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(!dir.exists(), "precondition: test dir must not pre-exist");
+        {
+            let exe = GeoExecutor::new().with_scratch_dir(dir.clone());
+            assert!(!exe.owns_scratch, "with_scratch_dir must clear owns_scratch");
+            assert_eq!(exe.scratch_dir, dir, "scratch_dir must be the supplied path");
+            assert!(dir.exists(), "with_scratch_dir should create the dir");
+        } // GeoExecutor dropped here
+        assert!(
+            dir.exists(),
+            "user-owned scratch dir must survive Drop (ORBIT_SCRATCH_DIR contract)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---------- baseline (D2a-d) — kept green ----------

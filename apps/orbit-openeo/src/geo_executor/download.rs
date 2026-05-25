@@ -23,6 +23,26 @@ pub trait Downloader: Send + Sync {
         crop: CropWindow,
         crop_crs: Option<&str>,
     ) -> Result<(), ExecError>;
+
+    /// **Task #34** — hint-aware variant. Callers that have STAC-derived
+    /// metadata (epsg, geo_transform, raster_size, dtype, nodata) may pass
+    /// it via `hint` so the downloader can short-circuit IFD round-trips
+    /// or parallelise bbox projection with the IFD fetch.
+    ///
+    /// Default impl ignores the hint and forwards to [`Self::download`] —
+    /// existing impls (gdal_translate / in-process / fixture) need no
+    /// changes. Only `AsyncTiffDownloader` overrides this method today.
+    #[cfg(feature = "async-tiff-downloader")]
+    fn download_with_meta(
+        &self,
+        src_url: &str,
+        dst_path: &Path,
+        crop: CropWindow,
+        crop_crs: Option<&str>,
+        _hint: Option<&orbit_geo::providers::BandMetadataHint>,
+    ) -> Result<(), ExecError> {
+        self.download(src_url, dst_path, crop, crop_crs)
+    }
 }
 
 /// Signs asset URLs before they reach the downloader.
@@ -146,14 +166,21 @@ impl Downloader for GdalTranslateDownloader {
 }
 
 /// In-process `Downloader` that calls `gdal::Dataset::open` directly --
-/// no subprocess fork-exec. Opt-in via
+/// no subprocess fork-exec. Installed via
 /// [`crate::geo_executor::GeoExecutor::with_inprocess_downloader`].
+///
+/// **Status (post-Task #34, 2026-05-24)**: this is the **P2 opt-out
+/// fallback** in `apps/orbit-openeo` when `async-tiff-downloader` is built.
+/// Activated by `ORBIT_INPROCESS_DOWNLOADER=1`. Wall: 71 / 76 / 88 s
+/// (78 avg) on 12 MP Wien S2 — tighter tail than P2 but slightly slower
+/// hot-path median. Use when monitoring shows P2 S3 body-error retry
+/// storms. See `docs/perf/FEATURE_FLAG_MATRIX.md`.
 ///
 /// Phase A microbench (2026-05-24) measured subprocess overhead at <500 ms
 /// vs >25 s S3 IO + decode -- i.e. the subprocess wrapper is not the
 /// bottleneck. This impl exists so the trait gains an additive
-/// no-subprocess option without changing the default behaviour, and to
-/// pave the path for P3 (direct-read inside block_executor).
+/// no-subprocess option without changing the constructor-level default,
+/// and to pave the path for P3 (direct-read inside block_executor).
 pub struct InProcessGdalDownloader;
 
 impl Downloader for InProcessGdalDownloader {
@@ -177,16 +204,43 @@ impl Downloader for InProcessGdalDownloader {
 }
 
 /// **P2** -- pure-Rust async `Downloader` that bridges to
-/// [`orbit_geo::providers::download_via_async_tiff_with_crs`] (async).
+/// [`orbit_geo::providers::download_via_async_tiff_with_crs_and_meta`] (async).
 /// Uses `object_store::aws::AmazonS3` for HTTP/2 pipelined range reads
-/// instead of libgdal `/vsicurl/`. Opt-in via
+/// instead of libgdal `/vsicurl/`. Installed via
 /// [`crate::geo_executor::GeoExecutor::with_async_tiff_downloader`].
 ///
+/// **Runtime default for `apps/orbit-openeo` (since 2026-05-24 / Task #34)**
+/// when the `async-tiff-downloader` feature is built. Opt out with
+/// `ORBIT_INPROCESS_DOWNLOADER=1` to fall back to the in-process libgdal
+/// path (P1) — preferred under S3 transport instability.
+/// See `docs/perf/FEATURE_FLAG_MATRIX.md`.
+///
 /// Falls back transparently to the in-process libgdal path (P1) for
-/// cross-CRS crops, non-tiled sources, multi-band sources, and any URL
+/// cross-CRS crops via PROJ-string / WKT (`EPSG:` is handled in-band via
+/// the `proj` crate), non-tiled sources, multi-band sources, and any URL
 /// scheme the parser does not recognise (`gs://`, plain `https://`, ...).
 #[cfg(feature = "async-tiff-downloader")]
 pub struct AsyncTiffDownloader;
+
+/// Dedicated multi-thread tokio runtime that drives the async-tiff +
+/// object_store IO. SEPARATE from the main openEO runtime to avoid the
+/// `block_in_place` + `Handle::current().block_on(...)` deadlock that
+/// occurred when the sync `Downloader::download` bridge was invoked from
+/// within `tokio::task::spawn_blocking` (the blocking thread is not a
+/// worker, so `Handle::current()` returns the main runtime and re-entry
+/// stalls under concurrency on the shared scheduler).
+///
+/// Lazily initialised once per process; reused across all downloads.
+#[cfg(feature = "async-tiff-downloader")]
+static ASYNC_TIFF_RT: once_cell::sync::Lazy<tokio::runtime::Runtime> =
+    once_cell::sync::Lazy::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_name("orbit-async-tiff")
+            .build()
+            .expect("orbit-async-tiff runtime")
+    });
 
 #[cfg(feature = "async-tiff-downloader")]
 impl Downloader for AsyncTiffDownloader {
@@ -197,22 +251,42 @@ impl Downloader for AsyncTiffDownloader {
         crop: CropWindow,
         crop_crs: Option<&str>,
     ) -> Result<(), ExecError> {
-        // Bridge sync -> async per CLAUDE.md §4 P0-5. Caller already
-        // routes us through `tokio::task::spawn_blocking` via
-        // `fetch_with_cache_async`, so we are on a blocking thread
-        // here; `block_in_place` + `Handle::block_on` is safe.
+        self.download_with_meta(src_url, dst_path, crop, crop_crs, None)
+    }
+
+    /// **Task #34**: hint-aware download. When the caller supplies a
+    /// [`BandMetadataHint`] harvested from STAC (epsg + transform + shape),
+    /// the underlying async-tiff path can:
+    /// - pre-decide cross-CRS handling without opening the file
+    /// - project the bbox in parallel with the IFD fetch
+    fn download_with_meta(
+        &self,
+        src_url: &str,
+        dst_path: &Path,
+        crop: CropWindow,
+        crop_crs: Option<&str>,
+        hint: Option<&orbit_geo::providers::BandMetadataHint>,
+    ) -> Result<(), ExecError> {
+        // Bridge sync -> async via a DEDICATED runtime. The caller routes
+        // us through `tokio::task::spawn_blocking` from the main runtime;
+        // using `Handle::current().block_on(...)` here would re-enter the
+        // main runtime from a blocking thread that isn't a worker, which
+        // deadlocks under concurrency (verified: 600 s hang on 12 MP S2
+        // NDVI). ASYNC_TIFF_RT is wholly separate, so block_on drives
+        // the future on its own workers.
         let src_owned = src_url.to_string();
         let dst_owned = dst_path.to_path_buf();
         let crop_crs_owned = crop_crs.map(str::to_string);
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(
-                orbit_geo::providers::download_via_async_tiff_with_crs(
-                    &src_owned,
-                    &dst_owned,
-                    Some(crop),
-                    crop_crs_owned.as_deref(),
-                ),
+        let hint_owned = hint.cloned();
+        let result = ASYNC_TIFF_RT.block_on(async move {
+            orbit_geo::providers::download_via_async_tiff_with_crs_and_meta(
+                &src_owned,
+                &dst_owned,
+                Some(crop),
+                crop_crs_owned.as_deref(),
+                hint_owned.as_ref(),
             )
+            .await
         });
         result
             .map(|_| ())
@@ -279,5 +353,92 @@ mod tests {
         assert_eq!(url_encode("a/b+c=d"), "a%2Fb%2Bc%3Dd");
         // Unreserved chars pass through.
         assert_eq!(url_encode("abcXYZ-._~"), "abcXYZ-._~");
+    }
+
+    /// Deadlock regression: 8 concurrent `AsyncTiffDownloader::download`
+    /// invocations on the MAIN tokio runtime via `spawn_blocking` must
+    /// all complete within 30 s. The pre-fix bridge used
+    /// `block_in_place` + `Handle::current().block_on(...)` which stalls
+    /// the shared scheduler under concurrency from blocking threads.
+    /// The post-fix bridge uses a dedicated runtime (ASYNC_TIFF_RT) so
+    /// there is no contention with the caller's runtime.
+    #[cfg(feature = "async-tiff-downloader")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn async_tiff_downloader_parallel_no_deadlock() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        // Build a small tiled COG fixture and stitch via the LOCAL parser
+        // path -- no network, no S3 -- so the test is hermetic. The local
+        // FS path inside async_download still flows through tokio IO, so
+        // the runtime-reentry bug reproduces here.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("src.tif");
+        write_fixture_tiled_cog(&src, 256, 256);
+
+        let dl: Arc<dyn Downloader> = Arc::new(AsyncTiffDownloader);
+        let crop = CropWindow {
+            min_x: 500_050.0,
+            max_y: 5_400_000.0,
+            max_x: 500_550.0,
+            min_y: 5_399_500.0,
+        };
+
+        let mut handles = Vec::with_capacity(8);
+        for i in 0..8u32 {
+            let dl_i = dl.clone();
+            let src_i = src.to_string_lossy().into_owned();
+            let dst_i = tmp.path().join(format!("out_{i}.tif"));
+            // Mirror production: bridge invoked inside spawn_blocking on
+            // the caller's runtime.
+            let h = tokio::task::spawn_blocking(move || {
+                dl_i.download(&src_i, &dst_i, crop, None)
+            });
+            handles.push(h);
+        }
+
+        // Wall-clock guard -- the deadlock case hangs ~600 s in prod.
+        let joined = tokio::time::timeout(Duration::from_secs(30), async move {
+            let mut outs = Vec::with_capacity(handles.len());
+            for h in handles {
+                outs.push(h.await.expect("join"));
+            }
+            outs
+        })
+        .await
+        .expect("all 8 concurrent downloads must finish within 30 s");
+
+        for (i, r) in joined.into_iter().enumerate() {
+            r.unwrap_or_else(|e| panic!("download {i} failed: {e}"));
+        }
+    }
+
+    /// Helper duplicate of crates/orbit-geo/src/async_download.rs's test
+    /// fixture writer. Local copy avoids a `pub` leak from the geo crate.
+    #[cfg(feature = "async-tiff-downloader")]
+    fn write_fixture_tiled_cog(path: &Path, cols: usize, rows: usize) {
+        use gdal::raster::{Buffer, RasterCreationOptions};
+        use gdal::DriverManager;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create_dir_all");
+        }
+        let drv = DriverManager::get_driver_by_name("GTiff").expect("GTiff");
+        let opts = RasterCreationOptions::from_iter([
+            "TILED=YES",
+            "BLOCKXSIZE=64",
+            "BLOCKYSIZE=64",
+            "COMPRESS=DEFLATE",
+        ]);
+        let mut ds = drv
+            .create_with_band_type_with_options::<u16, _>(path, cols, rows, 1, &opts)
+            .expect("create");
+        ds.set_geo_transform(&[500_000.0, 10.0, 0.0, 5_400_000.0, 0.0, -10.0])
+            .expect("gt");
+        let sr = gdal::spatial_ref::SpatialRef::from_epsg(32633).expect("sr");
+        ds.set_spatial_ref(&sr).expect("set_sr");
+        let mut b = ds.rasterband(1).expect("band");
+        let data: Vec<u16> = (0..(cols * rows)).map(|i| (i % 65535) as u16).collect();
+        let mut buf = Buffer::new((cols, rows), data);
+        b.write::<u16>((0, 0), (cols, rows), &mut buf).expect("write");
     }
 }

@@ -3,32 +3,91 @@
 
 use std::path::PathBuf;
 
-use orbit_geo::types::{BlockSize, ImageResolution};
-use orbit_geo::{LayerMapping, RasterDataset, RasterDatasetBuilder};
+use ndarray::Array3;
+use orbit_geo::types::{BlockSize, Dimension, ImageResolution};
+use orbit_geo::{LayerMapping, RasterDataBlock, RasterDataset, RasterDatasetBuilder};
 use serde_json::{json, Value};
 
 use crate::executor::ExecError;
 
 use crate::data_cube::DataCube;
 
-use super::{extract_raster_path, json_to_array1_u8, json_to_array2, GeoExecutor};
+use super::eval_reduce::{apply_reducer, eval_reduce_subgraph, parse_reducer_subgraph, ReducerKind};
+use super::{extract_raster_path, json_to_array1_u8, json_to_array2, GeoExecutor, SENTINEL_NDVI_NA};
 
 impl GeoExecutor {
-    /// openEO `merge_cubes` — mosaic two raster handles into one via
-    /// `orbit_geo::gdal_utils::mosaic` (gdalbuildvrt + gdal_translate).
+    /// openEO `merge_cubes` — joins two raster cubes per openEO 1.3.0 spec.
     /// Inputs may be `{cube1, cube2}` or `{data1, data2}` arg names.
+    ///
+    /// **2026-05-24 rewrite (BUG-003 follow-on)**: now implements the
+    /// openEO spec's Case 1 (band-axis join) when both inputs are `__cube`
+    /// envelopes with DISJOINT band names — produces a multi-band `__cube`
+    /// preserving both inputs' bands. Falls back to the legacy spatial
+    /// mosaic (`gdalbuildvrt + gdal_translate` → `__raster`) for `__raster`
+    /// inputs or single-file mosaic cases.
+    ///
+    /// Spec cases (1.3.0):
+    /// - Case 1 (disjoint bands) → band-axis join, no overlap_resolver needed
+    /// - Case 2 (overlapping bands + overlap_resolver) → per-pixel resolve
+    ///   (2026-05-25: implemented — resolver reuses the reducer machinery
+    ///   over a 2-element `[cube1, cube2]` stack)
+    /// - Case 3 (disjoint spatial / __raster) → spatial mosaic (legacy)
     pub(super) fn eval_merge_cubes(
         &self,
         args: std::collections::BTreeMap<String, Value>,
     ) -> Result<Value, ExecError> {
-        let p1 = extract_raster_path(
-            args.get("cube1").or_else(|| args.get("data1")),
-            "cube1",
-        )?;
-        let p2 = extract_raster_path(
-            args.get("cube2").or_else(|| args.get("data2")),
-            "cube2",
-        )?;
+        let cube1_val = args.get("cube1").or_else(|| args.get("data1"))
+            .ok_or_else(|| ExecError::InvalidGraph("merge_cubes: missing `cube1`".into()))?;
+        let cube2_val = args.get("cube2").or_else(|| args.get("data2"))
+            .ok_or_else(|| ExecError::InvalidGraph("merge_cubes: missing `cube2`".into()))?;
+
+        // Cases 1 & 2 both require two __cube envelopes with band maps.
+        if let (Some(c1_inner), Some(c2_inner)) = (cube1_val.get("__cube"), cube2_val.get("__cube")) {
+            if let (Some(b1), Some(b2)) = (
+                c1_inner.get("bands").and_then(|b| b.as_object()),
+                c2_inner.get("bands").and_then(|b| b.as_object()),
+            ) {
+                let overlap = b1.keys().any(|k| b2.contains_key(k));
+
+                // **Case 1: band-axis join** (DISJOINT bands) — union the
+                // two band maps. openEO "merge along non-overlapping bands".
+                if !overlap {
+                    let mut joined = serde_json::Map::new();
+                    for (k, v) in b1.iter().chain(b2.iter()) {
+                        joined.insert(k.clone(), v.clone());
+                    }
+                    let mut out = serde_json::Map::new();
+                    out.insert("bands".into(), Value::Object(joined));
+                    for key in ["bbox", "collection", "scene_count"] {
+                        if let Some(v) = c1_inner.get(key) {
+                            out.insert(key.into(), v.clone());
+                        }
+                    }
+                    return Ok(json!({ "__cube": Value::Object(out) }));
+                }
+
+                // **Case 2: overlap_resolver** (OVERLAPPING bands). Per
+                // openEO, the resolver callback has reducer signature —
+                // it receives `data` = the array of overlapping values
+                // (here `[cube1_px, cube2_px]`). Reuse the reducer machinery
+                // (#2) over a 2-element layer stack per (band, scene).
+                if let Some(resolver_val) = args.get("overlap_resolver") {
+                    return self.merge_cubes_resolve_overlap(b1, b2, c1_inner, resolver_val);
+                }
+                // Overlapping bands but NO resolver → spec says this is an
+                // error; fall through to spatial mosaic (legacy lenient).
+                tracing::warn!(
+                    "merge_cubes: overlapping bands without overlap_resolver — \
+                     falling back to spatial mosaic (spec would reject)"
+                );
+            }
+        }
+
+        // **Case 3 (legacy): spatial mosaic** for __raster inputs or
+        // mixed/overlapping __cube inputs. Falls back to gdalbuildvrt +
+        // gdal_translate per the pre-2026-05-24 behavior.
+        let p1 = extract_raster_path(Some(cube1_val), "cube1")?;
+        let p2 = extract_raster_path(Some(cube2_val), "cube2")?;
         let dst = self.scratch_dir.join(format!(
             "mosaic_{}.tif",
             std::time::SystemTime::now()
@@ -45,6 +104,117 @@ impl GeoExecutor {
                 "produced_by": "merge_cubes",
             }
         }))
+    }
+
+    /// **Case 2 (2026-05-25)**: resolve OVERLAPPING bands between two cubes
+    /// via the `overlap_resolver` callback. For each shared band + scene,
+    /// stack `[cube1_raster, cube2_raster]` as two layers and reduce them
+    /// per-pixel with the resolver (reducer signature: `data=[x,y]`).
+    /// Bands present in only one cube pass through unchanged (union).
+    fn merge_cubes_resolve_overlap(
+        &self,
+        b1: &serde_json::Map<String, Value>,
+        b2: &serde_json::Map<String, Value>,
+        c1_inner: &Value,
+        resolver_val: &Value,
+    ) -> Result<Value, ExecError> {
+        let resolver = parse_reducer_subgraph(resolver_val)?;
+        let n_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+
+        // Helper: parse a band's JSON path array into Vec<PathBuf>.
+        let paths_of = |v: &Value| -> Vec<PathBuf> {
+            v.as_array()
+                .map(|a| a.iter().filter_map(|p| p.as_str().map(PathBuf::from)).collect())
+                .unwrap_or_default()
+        };
+
+        let mut out_bands = serde_json::Map::new();
+        // Iterate the union of band names; resolve overlaps, forward the rest.
+        let all_keys: std::collections::BTreeSet<&String> =
+            b1.keys().chain(b2.keys()).collect();
+        for band in all_keys {
+            match (b1.get(band), b2.get(band)) {
+                (Some(v1), Some(v2)) => {
+                    // Overlapping band → resolve per scene.
+                    let p1 = paths_of(v1);
+                    let p2 = paths_of(v2);
+                    if p1.len() != p2.len() {
+                        return Err(ExecError::InvalidGraph(format!(
+                            "merge_cubes: band `{band}` scene-count mismatch ({} vs {})",
+                            p1.len(), p2.len()
+                        )));
+                    }
+                    let mut resolved: Vec<String> = Vec::with_capacity(p1.len());
+                    for (t, (a, b_path)) in p1.iter().zip(p2.iter()).enumerate() {
+                        let out_path = self.scratch_dir.join(format!(
+                            "merge_resolve_{band}_t{t}_{}.tif",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos()).unwrap_or(0)
+                        ));
+                        // Two-layer f32 dataset: layer 0 = cube1, 1 = cube2.
+                        let mut rds: RasterDataset<f32> =
+                            RasterDatasetBuilder::<f32>::from_files(&[a.clone(), b_path.clone()])
+                                .map_err(|e| ExecError::Backend(format!("merge_cubes resolve builder {band} t={t}: {e}")))?
+                                .resolution(ImageResolution { x: 10.0, y: -10.0 })
+                                .block_size(BlockSize { rows: self.crop_size as usize, cols: self.crop_size as usize })
+                                .build()
+                                .map_err(|e| ExecError::Backend(format!("merge_cubes resolve build {band} t={t}: {e}")))?;
+                        rds.metadata.shape.times = 1;
+                        rds.metadata.shape.layers = 2;
+                        rds.layer_mappings = vec![
+                            LayerMapping { source: a.clone(), time_pos: 0, layer_pos: 0, band: 1 },
+                            LayerMapping { source: b_path.clone(), time_pos: 0, layer_pos: 1, band: 1 },
+                        ];
+                        let red = resolver.clone();
+                        let worker = move |rdb: &RasterDataBlock<f32>, _dim: Dimension| -> Array3<f32> {
+                            let r = rdb.rows();
+                            let c = rdb.cols();
+                            let mut out = Array3::<f32>::from_elem((1, r, c), SENTINEL_NDVI_NA);
+                            let mut stack: Vec<f32> = Vec::with_capacity(2);
+                            for row in 0..r {
+                                for col in 0..c {
+                                    stack.clear();
+                                    for l in 0..rdb.layers() {
+                                        let v = rdb.data[[0, l, row, col]];
+                                        if v.is_finite() && v != SENTINEL_NDVI_NA {
+                                            stack.push(v);
+                                        }
+                                    }
+                                    if !stack.is_empty() {
+                                        out[[0, row, col]] = match &red {
+                                            ReducerKind::Builtin(rr) => apply_reducer(&mut stack, *rr),
+                                            ReducerKind::SubGraph(pg) => {
+                                                eval_reduce_subgraph(pg, &stack).unwrap_or(SENTINEL_NDVI_NA)
+                                            }
+                                        };
+                                    }
+                                }
+                            }
+                            out
+                        };
+                        rds.apply_reduction::<f32, _>(worker, Dimension::Layer, n_threads, &out_path, SENTINEL_NDVI_NA)
+                            .map_err(|e| ExecError::Backend(format!("merge_cubes resolve {band} t={t}: {e}")))?;
+                        resolved.push(out_path.to_string_lossy().into_owned());
+                    }
+                    out_bands.insert(band.clone(), Value::Array(resolved.into_iter().map(Value::String).collect()));
+                }
+                // Band only in one cube → forward unchanged (union).
+                (Some(v), None) | (None, Some(v)) => {
+                    out_bands.insert(band.clone(), v.clone());
+                }
+                (None, None) => unreachable!("band came from the union of b1/b2 keys"),
+            }
+        }
+
+        let mut out = serde_json::Map::new();
+        out.insert("bands".into(), Value::Object(out_bands));
+        for key in ["bbox", "collection", "scene_count"] {
+            if let Some(v) = c1_inner.get(key) {
+                out.insert(key.into(), v.clone());
+            }
+        }
+        Ok(json!({ "__cube": Value::Object(out) }))
     }
 
     /// orbit-extension `aggregate_spatial_point` — sample raster values
@@ -514,6 +684,78 @@ mod tests {
         let out_path = v["__raster"]["path"].as_str().unwrap();
         let bytes = std::fs::read(out_path).unwrap();
         assert!(bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*"));
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// **BUG-003 follow-on (2026-05-24)**: when both inputs are `__cube`
+    /// envelopes with DISJOINT band names, merge_cubes joins along the
+    /// bands dimension and returns a `__cube` with the union of bands —
+    /// matching openEO 1.3.0 Case 1 semantics.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_cubes_band_axis_join_when_inputs_are_cubes_with_disjoint_bands() {
+        let exe = GeoExecutor::new();
+        let body = graph(json!({
+            "m": { "process_id": "merge_cubes",
+                   "arguments": {
+                       "cube1": { "__cube": { "bands": { "ndvi":  ["/tmp/n0.tif", "/tmp/n1.tif"] } } },
+                       "cube2": { "__cube": { "bands": { "gndvi": ["/tmp/g0.tif", "/tmp/g1.tif"] } } }
+                   },
+                   "result": true }
+        }));
+        let r = exe.run_sync(&body).await.expect("merge_cubes band-axis join");
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        // Must be __cube (NOT __raster — that would be the legacy spatial mosaic).
+        let cube = v.get("__cube").expect("output must be __cube envelope");
+        let bands = cube.get("bands").and_then(|b| b.as_object()).expect("bands map");
+        assert_eq!(bands.len(), 2, "union of disjoint bands must have 2 entries");
+        assert!(bands.contains_key("ndvi"), "ndvi band preserved from cube1");
+        assert!(bands.contains_key("gndvi"), "gndvi band preserved from cube2");
+        // Time-series paths preserved per band.
+        assert_eq!(bands["ndvi"].as_array().unwrap().len(), 2);
+        assert_eq!(bands["gndvi"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merge_cubes_overlap_resolver_sums_overlapping_band() {
+        // Case 2 (2026-05-25): two cubes share band "ndvi". cube1=10,
+        // cube2=32 everywhere. overlap_resolver=sum → output 42.
+        let scratch = temp_root("merge-resolve");
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let mk = |path: &std::path::Path, val: f32| {
+            let mut ds = driver.create_with_band_type::<f32, _>(path, 4, 4, 1).unwrap();
+            ds.set_geo_transform(&[300000.0, 10.0, 0.0, 5400000.0, 0.0, -10.0]).unwrap();
+            let sr = gdal::spatial_ref::SpatialRef::from_epsg(32633).unwrap();
+            ds.set_spatial_ref(&sr).unwrap();
+            let mut band = ds.rasterband(1).unwrap();
+            let mut buf = gdal::raster::Buffer::new((4, 4), vec![val; 16]);
+            band.write::<f32>((0, 0), (4, 4), &mut buf).unwrap();
+        };
+        let a = scratch.join("ndvi_c1.tif");
+        let b = scratch.join("ndvi_c2.tif");
+        mk(&a, 10.0);
+        mk(&b, 32.0);
+        let exe = GeoExecutor::new().with_scratch_dir(scratch.clone());
+        let body = graph(json!({
+            "m": { "process_id": "merge_cubes",
+                   "arguments": {
+                       "cube1": { "__cube": { "bands": { "ndvi": [a.to_str().unwrap()] } } },
+                       "cube2": { "__cube": { "bands": { "ndvi": [b.to_str().unwrap()] } } },
+                       "overlap_resolver": { "process_graph": {
+                           "s": { "process_id": "sum", "arguments": {"data": {"from_parameter": "data"}}, "result": true }
+                       }}
+                   },
+                   "result": true }
+        }));
+        let r = exe.run_sync(&body).await.expect("merge_cubes overlap resolve");
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        // Output is __cube (NOT __raster mosaic) with the resolved ndvi band.
+        let out_path = v["__cube"]["bands"]["ndvi"][0].as_str().expect("resolved ndvi path");
+        let ds = gdal::Dataset::open(out_path).unwrap();
+        let band = ds.rasterband(1).unwrap();
+        let buf: gdal::raster::Buffer<f32> = band.read_as((0,0),(4,4),(4,4),None).unwrap();
+        // Every pixel = 10 + 32 = 42.
+        assert!(buf.data().iter().all(|&p| (p - 42.0).abs() < 1e-3),
+                "overlap_resolver=sum must yield 42 everywhere, got {:?}", &buf.data()[..4]);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 

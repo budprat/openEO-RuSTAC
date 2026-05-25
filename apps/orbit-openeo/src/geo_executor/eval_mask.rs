@@ -198,33 +198,51 @@ impl GeoExecutor {
         // Sentinel-2 SCL is published at 20 m while B04/B08/etc. are at 10 m.
         // Passing the raw SCL into apply_reduction_with_mask trips the
         // num_blocks consistency check ("data has 9 blocks, mask has 4")
-        // because block partitioning is cols/rows / block_size. Resample
-        // SCL onto each scene's first data-band grid up-front (nearest
-        // neighbour — SCL classes are categorical 0..=11). Resampled
-        // outputs are cached in `scratch_dir` and reused across calls.
+        // because block partitioning is cols/rows / block_size.
+        //
+        // **BUG-001 fix (2026-05-24)**: resample SCL **per data band**, not
+        // just to the first band's grid. The pre-fix code picked
+        // `band_paths.values().next()` (first band alphabetically) and
+        // reused that grid for every band's mask. When the load mixed 10 m
+        // bands (B04, B08) with 20 m bands (B11, B12), the 20 m bands
+        // misaligned with the now-10 m mask and fell over with
+        // "data has 4 blocks, mask has 9".
+        //
+        // Per-band resample produces one SCL-resampled file per
+        // (band, scene) combination, indexed by band key. Disk cost: 4×
+        // for a 4-band load vs the prior 1× — acceptable since SCL crops
+        // are typically <100 KB each and the executor's Drop GC reclaims
+        // scratch at process exit (Task #38).
         //
         // P0-5: gdalwarp shells out and blocks — wrap in spawn_blocking
         // so the async runtime keeps progressing other jobs.
-        let probe_band_paths: Vec<PathBuf> = band_paths
-            .values()
-            .next()
-            .cloned()
-            .unwrap_or_default();
-        let mut effective_scl_paths: Vec<PathBuf> = Vec::with_capacity(scl_paths.len());
-        for (t, scl_path) in scl_paths.iter().enumerate() {
-            let data_path = probe_band_paths.get(t).cloned().ok_or_else(|| {
-                ExecError::Backend(format!(
-                    "mask_scl: missing probe band path at scene t={t}"
-                ))
-            })?;
-            let out_path = self.scratch_dir.join(format!("scl_resampled_t{t}.tif"));
-            let scl_path_clone = scl_path.clone();
-            let resampled = tokio::task::spawn_blocking(move || {
-                resample_scl_to_data_grid(&scl_path_clone, &data_path, &out_path)
-            })
-            .await
-            .map_err(|e| ExecError::Backend(format!("mask_scl: resample join t={t}: {e}")))??;
-            effective_scl_paths.push(resampled);
+        let mut effective_scl_paths_per_band: std::collections::BTreeMap<String, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        for (band_key, band_paths_for_band) in &band_paths {
+            super::identifier::validate_identifier(band_key, "mask_scl_dilation.bands")?;
+            let mut per_band_scls: Vec<PathBuf> = Vec::with_capacity(scl_paths.len());
+            for (t, scl_path) in scl_paths.iter().enumerate() {
+                let data_path = band_paths_for_band.get(t).cloned().ok_or_else(|| {
+                    ExecError::Backend(format!(
+                        "mask_scl: missing band `{band_key}` path at scene t={t}"
+                    ))
+                })?;
+                let out_path = self
+                    .scratch_dir
+                    .join(format!("scl_resampled_{band_key}_t{t}.tif"));
+                let scl_path_clone = scl_path.clone();
+                let resampled = tokio::task::spawn_blocking(move || {
+                    resample_scl_to_data_grid(&scl_path_clone, &data_path, &out_path)
+                })
+                .await
+                .map_err(|e| {
+                    ExecError::Backend(format!(
+                        "mask_scl: resample join {band_key} t={t}: {e}"
+                    ))
+                })??;
+                per_band_scls.push(resampled);
+            }
+            effective_scl_paths_per_band.insert(band_key.clone(), per_band_scls);
         }
 
         let n_threads = std::thread::available_parallelism()
@@ -327,13 +345,20 @@ impl GeoExecutor {
 
         // Mask every discovered band, per-scene. Output paths follow the
         // pattern `<band>_masked_t{t}.tif` (e.g. B04_masked_t0.tif).
+        // BUG-001 fix: zip each band against its OWN resampled SCL grid
+        // (was: every band zipped against the same first-band grid).
         let mut masked_bands: std::collections::BTreeMap<String, Vec<PathBuf>> =
             std::collections::BTreeMap::new();
         for (band_key, paths) in &band_paths {
-            super::identifier::validate_identifier(band_key, "mask_scl_dilation.bands")?;
+            // identifier already validated above during per-band SCL resample.
+            let scl_paths_for_band = effective_scl_paths_per_band
+                .get(band_key)
+                .ok_or_else(|| ExecError::Backend(format!(
+                    "mask_scl: missing resampled SCL for band `{band_key}`"
+                )))?;
             let mut masked: Vec<PathBuf> = Vec::with_capacity(paths.len());
             for (t, (band_path, scl_path)) in
-                paths.iter().zip(effective_scl_paths.iter()).enumerate()
+                paths.iter().zip(scl_paths_for_band.iter()).enumerate()
             {
                 let out_path = self.scratch_dir.join(format!("{band_key}_masked_t{t}.tif"));
                 mask_band(band_path, scl_path, &out_path, band_key, t)?;

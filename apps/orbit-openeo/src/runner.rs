@@ -81,7 +81,42 @@ pub async fn run_job(
     });
 
     // compute (download + transform + write)
-    let result = executor.run_sync(&body).await;
+    //
+    // **Job timeout (2026-05-25, ported from JonaAI jobs.py poll-loop)**:
+    // bound the executor wall-clock so a hung download / pathological graph
+    // can't pin a worker forever. Default 600 s; override via
+    // `ORBIT_JOB_TIMEOUT_SECS`. On timeout the job transitions to `error`
+    // (NOT a panic) and the timed-out future is dropped. Note: a
+    // spawn_blocking GDAL call already in flight finishes in the
+    // background (tokio can't preempt it) but its result is discarded —
+    // the job is already marked failed, matching JonaAI's behaviour.
+    let timeout_secs: u64 = std::env::var("ORBIT_JOB_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(600);
+    let result = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        executor.run_sync(&body),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_elapsed) => {
+            tracing::error!(
+                job_id = %job_id, timeout_secs,
+                "job exceeded ORBIT_JOB_TIMEOUT_SECS — marking error"
+            );
+            let _ = store.set_status(job_id, JobStatus::Error).await;
+            bus.publish(JobEvent {
+                user_id: user_id.to_string(),
+                job_id: job_id.to_string(),
+                kind: JobEventKind::Failed,
+            });
+            record_terminal("timeout");
+            return RunOutcome::Failed(format!("job timed out after {timeout_secs}s"));
+        }
+    };
 
     // phase 2: compute done — start persisting
     let _ = store.set_progress(job_id, 80.0).await;
@@ -304,6 +339,42 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v.as_f64().unwrap(), 42.0);
         assert_eq!(rec.assets[0].size, bytes.len() as u64);
+    }
+
+    /// Executor that sleeps longer than the configured timeout, to drive
+    /// the timeout path. Returns a trivial result if it ever completes.
+    struct SlowExecutor {
+        sleep: std::time::Duration,
+    }
+    #[async_trait::async_trait]
+    impl ProcessGraphExecutor for SlowExecutor {
+        async fn run_sync(&self, _body: &Value) -> Result<crate::executor::SyncResult, crate::executor::ExecError> {
+            tokio::time::sleep(self.sleep).await;
+            Ok(crate::executor::SyncResult::json(&serde_json::json!(1)))
+        }
+        async fn enqueue(&self, _body: &Value) -> Result<String, crate::executor::ExecError> {
+            Ok("job-slow".into())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_times_out_and_marks_error() {
+        // SAFETY: env mutation in a test. The only reader is run_job; the
+        // value (1s) is harmless for the millisecond-fast sibling tests.
+        unsafe { std::env::set_var("ORBIT_JOB_TIMEOUT_SECS", "1"); }
+        let body = serde_json::json!({"process": {"process_graph": {
+            "a": {"process_id": "add", "arguments": {"x": 1, "y": 1}, "result": true}
+        }}});
+        let (store, _exe, bus, files, metrics, id, user) = fixture(body.clone()).await;
+        // Swap in a SlowExecutor that sleeps 5s vs the 1s timeout.
+        let slow: Arc<dyn ProcessGraphExecutor> = Arc::new(SlowExecutor {
+            sleep: std::time::Duration::from_secs(5),
+        });
+        let outcome = run_job(&id, &user, body, store.clone(), slow, bus, files, metrics).await;
+        unsafe { std::env::remove_var("ORBIT_JOB_TIMEOUT_SECS"); }
+        assert!(matches!(outcome, RunOutcome::Failed(ref m) if m.contains("timed out")),
+                "expected timeout Failed, got {outcome:?}");
+        assert_eq!(store.get(&id).await.unwrap().status, JobStatus::Error);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

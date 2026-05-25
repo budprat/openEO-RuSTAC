@@ -101,3 +101,6 @@ uuid                 = { workspace = true }
 # library consumers.
 gdal                 = "0.19"
 async-trait          = { workspace = true }
+# Used by the AsyncTiffDownloader deadlock-regression test in
+# `geo_executor/download.rs::tests` (gated cfg(feature = "async-tiff-downloader")).
+tempfile             = "3"

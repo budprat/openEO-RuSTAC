@@ -13,3 +13,9 @@
 .idea/
 .vscode/
 *.log
+
+# Claude Code per-user runtime state (memory, session state, cache, analytics).
+# Not project code — must not be committed.
+.claude/
+
+docs/
