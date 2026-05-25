@@ -4,7 +4,7 @@
 > Foundation crate for the full `orbit-rs` platform (ETL + LLM agent + satellite/geo).
 >
 > 🛰️ **openEO**: `apps/orbit-openeo` is a **reference, NOT certified** openEO 1.3.0 backend — see the scope contract at [`apps/orbit-openeo/BACKEND-SCOPE.md`](apps/orbit-openeo/BACKEND-SCOPE.md). Strategic basis: [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../13-geo-satellite/04-openeo-strategic-analysis.md) §4.5 (Approach D).
-> 📚 **Docs**: see [`docs/README.md`](docs/README.md) for the layout map (plans, parity, perf, archive).
+> 📚 **Docs**: [`CLAUDE.md`](CLAUDE.md) is the live build / run / perf runbook (incl. §9 deferred work); [`CHANGELOG.md`](CHANGELOG.md) tracks changes.
 
 ---
 
@@ -30,7 +30,7 @@
 ## Build
 
 ```bash
-cd /Users/macbookpro/Rust/mvp/orbit-etl
+cd /Users/macbookpro/Rust_Sentinel/mvp/orbit-etl
 
 # Sanity check
 cargo check --workspace
@@ -157,6 +157,8 @@ shared: orbit-proto (proto-generated gRPC types)
 
 ## What's next (Phases 2-7)
 
+> ✅ **Shipped since this MVP**: Phase 4 `orbit-geo` (STAC + Sentinel-2, async-tiff/`object_store` streaming) and the openEO 1.3.0 **reference backend** `apps/orbit-openeo` (69 processes, P2-full default download). See `apps/orbit-openeo/README.md` + `CLAUDE.md`.
+
 Phase 2 — add object_store source/sink (read from S3, write Parquet) — see [`11-framework-design/01-storage-workflow.md`](../../11-framework-design/01-storage-workflow.md)
 
 Phase 3 — LLM agent crate (`orbit-agent`) — see [`11-framework-design/02-domain-blueprints.md` Domain B](../../11-framework-design/02-domain-blueprints.md#domain-b--llm-agent-platform)
@@ -173,4 +175,4 @@ Phase 7 — Plugins + resilience — see [`14-resilience-plugins/01-plugins-resi
 
 ## License
 
-MIT OR Apache-2.0 (pick when you publish).
+MIT — see [`LICENSE`](LICENSE).

@@ -8,14 +8,25 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 ## [Unreleased]
 
 ### Added
-- `docs/plans/02-net-new-gaps.md` tracking 32 production-grade gap tasks (G1.1–G7.5) across 7 tracks.
-- `apps/orbit-openeo/BACKEND-SCOPE.md` operational scope contract (MAY / WILL NOT) for the reference openEO backend.
-- `docs/README.md` directory index.
-- `docs/archive/`, `docs/parity/`, `docs/perf/` subdirectories consolidating measurement and historical artifacts.
+- **openEO process set 8 → 69** (strictly per the 1.3.0 spec): 31 scalar math/logic ops, 9 array processes, cube-metadata ops (`filter_bands`/`rename_labels`/`add_dimension`/`drop_dimension`), `merge_cubes` (band-axis join + `overlap_resolver`), arbitrary `reduce_dimension` callbacks + a `bands` axis. Authoritative list: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`.
+- **P2-full download path is now the default**: async-tiff + `object_store` streaming + STAC `band_metadata` hint, shared S3 connection pool, cross-CRS reprojection via `proj`. Opt out to in-process GDAL with `ORBIT_INPROCESS_DOWNLOADER=1`.
+- DN→reflectance scaling from STAC `raster:bands.scale`/`offset`.
+- Job lifecycle: orphan recovery on startup + `ORBIT_JOB_TIMEOUT_SECS`.
+- Observability: `ORBIT_SCRATCH_DIR` (pin/preserve scratch for value-verification) + per-job phase-timing logs (download/mask/compute split); `ORBIT_DOWNLOAD_CONCURRENCY`, `ORBIT_S3_*` tuning.
+- `apps/orbit-openeo/BACKEND-SCOPE.md` operational scope contract (MAY / WILL NOT).
+- Example process graphs under `apps/orbit-openeo/examples/` (10/15-node + branching-diamond + environmental).
 
 ### Changed
-- `13-geo-satellite/04-openeo-strategic-analysis.md` revised to declare **Approach D** (client adapter + reference backend) superseding the 2026-05-21 Approach C commitment. §8 converted to retrospective documenting what the client adapter actually shipped.
-- Documentation moved to a structured layout: parity audit and parity plan archived to `docs/archive/`; component comparison and `MISSING_FEATURES.md` moved to `docs/parity/`; `BENCHMARK_BASELINE.md` moved to `docs/perf/`.
+- `apps/orbit-openeo` dispatch moved to a `ProcessRegistry` + `ProcessHandler` trait (superseding the planned typed-`ProcessNode`-enum-only dispatcher, G1.6).
+- `merge_cubes` corrected from spatial-mosaic-at-averaged-resolution to a true band-axis join (openEO Cases 1/2/3).
+- Default downloader flipped from in-process GDAL (P1) to P2-full.
+- `13-geo-satellite/04-openeo-strategic-analysis.md` declares **Approach D** (client adapter + reference backend), superseding the 2026-05-21 Approach C commitment.
+
+### Fixed
+- BUG-001..005 (diamond-DAG): `mask_scl_dilation` mixed-resolution, `reduce_dimension` index allow-list, `apply` post-`merge_cubes`, `reduce_dimension(bands)`, `apply` multi-band.
+
+### Removed
+- The `docs/` tree (plans, parity, perf, archive, README) removed from version control; build/run/perf guidance consolidated into `CLAUDE.md` (incl. §9 deferred work). `docs/` and `.claude/` are now git-ignored.
 - `RELEASE_NOTES.md` retired in favour of this Keep-a-Changelog `CHANGELOG.md`.
 
 ---
@@ -106,5 +117,5 @@ CI does not currently fail on bench regressions. The 10% regression budget lands
 
 ---
 
-[Unreleased]: https://github.com/NU/orbit-rs/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/NU/orbit-rs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/budprat/openEO-RuSTAC/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/budprat/openEO-RuSTAC/releases/tag/v0.1.0
