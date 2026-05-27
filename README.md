@@ -17,9 +17,9 @@ The server lives in [`apps/orbit-openeo`](apps/orbit-openeo); the raster engine 
 the openEO process-graph AST in [`crates/eo-process`](crates/eo-process). The repo is a Cargo workspace that also
 carries an ETL foundation (`orbit-etl` + CLI/gRPC server) — see [Monorepo layout](#-monorepo-layout).
 
-> 🙏 **Credits.** The `orbit-geo` API surface is design-inspired by the **JRSRP EORS Workspace**
-> (`eorst` + `rss_core`, LGPL-3.0). The implementation is clean-room — EORS is credited as the
-> design inspiration; no EORS code is included. See [`NOTICE.md`](NOTICE.md) for full attribution.
+> 🙏 **Credits.** The `orbit-geo` API surface is derived from the **JRSRP EORS Workspace**
+> (`eorst` + `rss_core`, LGPL-3.0). EORS is credited as the upstream this work derives from.
+> See [`NOTICE.md`](NOTICE.md) for full attribution.
 
 ---
 
