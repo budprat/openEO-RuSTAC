@@ -54,6 +54,8 @@ pub struct AppState {
     /// In-flight job task registry (cooperative cancellation + graceful
     /// drain on shutdown). audit-fix 2026-06-03.
     pub job_registry: Arc<crate::job_registry::JobRegistry>,
+    /// User-defined process graph (UDP) store for `/process_graphs`.
+    pub udp: Arc<crate::udp_store::UdpStore>,
 }
 
 /// Builder for [`AppState`].
@@ -233,6 +235,7 @@ impl AppStateBuilder {
                 .job_sem
                 .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(16))),
             job_registry: Arc::new(crate::job_registry::JobRegistry::new()),
+            udp: Arc::new(crate::udp_store::UdpStore::new()),
         }
     }
 }

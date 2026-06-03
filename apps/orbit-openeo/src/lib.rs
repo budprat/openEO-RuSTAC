@@ -42,6 +42,7 @@ pub mod job_store;
 pub mod process_catalog;
 pub mod process_graph;
 pub mod routes;
+pub mod udp_store;
 pub mod runner;
 pub mod schema;
 pub mod security;
