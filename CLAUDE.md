@@ -50,15 +50,15 @@ cargo build -p orbit-openeo --features geo-kernel
 
 ```bash
 cargo test -p orbit-geo --lib                                    # 134 tests
-cargo test -p orbit-openeo --features geo-kernel --lib           # 515 tests (hermetic; no synthetic-S2 fixtures)
+cargo test -p orbit-openeo --features geo-kernel --lib           # 543 tests (hermetic; no synthetic-S2 fixtures)
 cargo test -p orbit-openeo --features geo-kernel --test ndvi_mean_time_e2e             # 3 integration tests
 cargo test -p orbit-openeo --features geo-kernel --test complex_pipeline_verification  # 4 integration tests
 cargo test -p orbit-openeo --features geo-kernel --test mask_from_values_e2e           # 3 integration tests
 cargo test -p orbit-openeo --features geo-kernel --test apply_callback_e2e             # 3 integration tests
 ```
 
-Aggregate: **~662 tests, 0 failed** across orbit-geo lib (134) + orbit-openeo
-lib (515) + 4 integration test files (13). If `orbit-geo` shows 0 passed too,
+Aggregate: **~690 tests, 0 failed** across orbit-geo lib (134) + orbit-openeo
+lib (543) + 4 integration test files (13). If `orbit-geo` shows 0 passed too,
 re-run with `--lib` explicitly — `cargo test -p orbit-geo` alone runs the
 default harness which can be empty for the bin target.
 
@@ -82,9 +82,11 @@ per-block NDVI compute, time reduction, GeoTIFF write to
 
 ```json
 {
-  "id": "job-XXXXXXXX",
+  "id": "<job-uuid>",
   "stac_version": "1.0.0",
   "type": "Feature",
+  "geometry": null,
+  "properties": { "datetime": "<rfc3339>" },
   "assets": {
     "result.tif": { "href": "/jobs/.../results/result.tif", "type": "image/tiff", "file:size": <N> }
   }
@@ -601,10 +603,12 @@ mvp/orbit-etl/
 │       │   │   ├── sub_graph.rs           — SubGraphEvaluator + require_subgraph (A3)
 │       │   │   └── identifier.rs          — validate_identifier path-traversal allowlist (B1)
 │       │   ├── executor.rs              — JSON LocalExecutor
-│       │   ├── process_graph.rs         — topo walker, P0-3 short-circuit
+│       │   ├── process_graph.rs         — topo walker, P0-3 short-circuit, process-id collection
+│       │   ├── process_catalog.rs       — non-gated process descriptions for GET /processes + validation
+│       │   ├── udp_store.rs             — in-memory user-defined process-graph (UDP) store
 │       │   ├── url_policy.rs            — P1-7 SSRF guard
 │       │   ├── file_store.rs            — P1-6 hardened paths
-│       │   └── runner.rs                — lifecycle, events, error tracing
+│       │   └── runner.rs                — lifecycle, events, error tracing, per-job log capture
 │       ├── examples/
 │       │   ├── ndvi_mean_time.json      — canonical openEO 1.3.0 graph
 │       │   └── test_ndvi_e2e.sh         — live HTTP roundtrip
