@@ -8,7 +8,16 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 ## [Unreleased]
 
 ### Added
-- **openEO process set 8 → 67** (strictly per the 1.3.0 spec): 31 scalar math/logic ops, 9 array processes, cube-metadata ops (`filter_bands`/`rename_labels`/`add_dimension`/`drop_dimension`), `merge_cubes` (band-axis join + `overlap_resolver`), arbitrary `reduce_dimension` callbacks + a `bands` axis. Authoritative list: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`.
+- **openEO conformance + process audit (2026-06-03)** — see `apps/orbit-openeo/PROCESS_AUDIT.md` + `ENDPOINT_AUDIT.md`:
+  - `GET /processes` now advertises all **68** implemented processes (was `[]`); single source of truth `src/process_catalog.rs`, asserted equal to the runtime registry by a test.
+  - `GET /conformance` (+ root `conformsTo`) added; the capabilities `conformance` link was previously a 404.
+  - `GET /file_formats` (`{input, output}`) added per spec; `/output_formats` kept as a pre-1.0 alias.
+  - Standard `aggregate_spatial(data, geometries, reducer)` implemented (GeoJSON → raster-CRS reproject + reducer callback).
+  - `GET /jobs/{id}/logs` returns real per-job log entries (runner lifecycle capture; `append_log`/`get_logs` on both stores, SQLite gains a guarded `logs` column).
+  - `GET /jobs/{id}/estimate` is now job-aware (404s unknown jobs; real output size + ISO-8601 duration).
+  - User-defined process graph (UDP) storage: `GET /process_graphs`, `GET`/`PUT`/`DELETE /process_graphs/{id}` backed by an in-memory `UdpStore`.
+  - Submit-time validation: `POST /jobs` + `POST /validation` reject unimplemented top-level processes (`ProcessUnsupported`).
+- **openEO process set 8 → 68** (strictly per the 1.3.0 spec): 31 scalar math/logic ops, 9 array processes, cube-metadata ops (`filter_bands`/`rename_labels`/`add_dimension`/`drop_dimension`), `merge_cubes` (band-axis join + `overlap_resolver`), arbitrary `reduce_dimension` callbacks + a `bands` axis, standard `aggregate_spatial`. Authoritative list: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`.
 - **P2-full download path is now the default**: async-tiff + `object_store` streaming + STAC `band_metadata` hint, shared S3 connection pool, cross-CRS reprojection via `proj`. Opt out to in-process GDAL with `ORBIT_INPROCESS_DOWNLOADER=1`.
 - DN→reflectance scaling from STAC `raster:bands.scale`/`offset`.
 - Job lifecycle: orphan recovery on startup + `ORBIT_JOB_TIMEOUT_SECS`.
@@ -21,9 +30,15 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - `merge_cubes` corrected from spatial-mosaic-at-averaged-resolution to a true band-axis join (openEO Cases 1/2/3).
 - Default downloader flipped from in-process GDAL (P1) to P2-full.
 - `13-geo-satellite/04-openeo-strategic-analysis.md` declares **Approach D** (client adapter + reference backend), superseding the 2026-05-21 Approach C commitment.
+- **Job ids are now RFC-4122 v4 UUIDs** (was the counter-based `job-{hex}`); the SQLite restart counter-seeding was removed (UUIDs never collide). Ids remain opaque strings to every consumer.
+- `apply` + `reduce_dimension` callbacks now accept the **same pure-numeric process set** as the top-level registry (added trig, `mod`/`sgn`/`floor`/`ceil`/`round`/`int`, `normalized_difference`, `between`); `apply` binds any callback parameter name.
+- `GET /jobs/{id}/results` returns a **valid STAC Item** (adds `geometry`, `bbox`, `properties.datetime`, `self`/`canonical` links).
+- `/process_graphs` uses the spec-correct verbs (`PUT` to store; no `POST`/`PATCH`).
 
 ### Fixed
 - BUG-001..005 (diamond-DAG): `mask_scl_dilation` mixed-resolution, `reduce_dimension` index allow-list, `apply` post-`merge_cubes`, `reduce_dimension(bands)`, `apply` multi-band.
+- **`filter_temporal` / `filter_bbox` / `filter_spatial` were silent no-ops** that returned UNFILTERED data — now perform real filtering (scene-datetime pruning / per-band-scene re-crop), and reject inputs they can't filter instead of silently passing them through.
+- **`resample_spatial`** warped only the first band of the first scene (dropping the rest) — now reprojects every band × scene and preserves the band map; rejects an unsupported non-zero `resolution`.
 
 ### Removed
 - The `docs/` tree (plans, parity, perf, archive, README) removed from version control; build/run/perf guidance consolidated into `CLAUDE.md` (incl. §9 deferred work). `docs/` and `.claude/` are now git-ignored.

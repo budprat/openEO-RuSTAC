@@ -45,7 +45,7 @@ carries an ETL foundation (`orbit-etl` + CLI/gRPC server) — see [Monorepo layo
 | | |
 |---|---|
 | **openEO 1.3.0 REST API** | Axum server; every request JSON-Schema-validated against the shipped `spec/openapi.json`. |
-| **67 openEO processes** | Reducers + arbitrary callbacks, `merge_cubes` (band-join + overlap-resolve), per-pixel `apply`, 31 scalar math/logic + 9 array processes, cube-metadata ops. Authoritative list: `geo_executor/registry.rs::register_defaults`. |
+| **68 openEO processes** | Reducers + arbitrary callbacks, `merge_cubes` (band-join + overlap-resolve), per-pixel `apply`, standard `aggregate_spatial`, real `filter_temporal`/`filter_bbox`/`filter_spatial`, 31 scalar math/logic + 9 array processes, cube-metadata ops. Authoritative list: `geo_executor/registry.rs::register_defaults` (mirrored by `src/process_catalog.rs` for `GET /processes`). |
 | **P2-full streaming download (default)** | Pure-Rust [`async-tiff`](https://crates.io/crates/async-tiff) + [`object_store`](https://crates.io/crates/object_store) COG reads with a STAC `band_metadata` hint and a shared S3 connection pool — **no libGDAL on the hot read path**. |
 | **Cross-CRS, no GDAL fallback** | bbox reprojection via pure-Rust [`proj`](https://crates.io/crates/proj). |
 | **Block-parallel compute** | `RasterDataset<f32>` tiled, multi-threaded reduction kernels. |
@@ -203,13 +203,13 @@ Confirm the active path in the logs: `downloader: async-tiff + object_store + ST
 
 ## 🧩 Supported processes
 
-**67 processes** as of 2026-05-25 (authoritative: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`):
+**68 processes** as of 2026-06-03 (authoritative: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`):
 
 | Category | Processes |
 |---|---|
 | **Data access** | `load_collection` (DN→reflectance), `save_result` (GeoTIFF, PNG) |
 | **Cube structure** | `filter_bands`, `filter_temporal`, `filter_spatial`, `filter_bbox`, `rename_labels`, `add_dimension`, `drop_dimension`, `resample_spatial` |
-| **Reduce / combine** | `reduce_dimension` (mean/min/max/sum/median/count/first/last/sd/variance **+ arbitrary callbacks**, over `t` **and** `bands`), `merge_cubes` (band-join · overlap-resolver · spatial mosaic), `aggregate_spatial_*` |
+| **Reduce / combine** | `reduce_dimension` (mean/min/max/sum/median/count/first/last/sd/variance **+ arbitrary callbacks**, over `t` **and** `bands`), `merge_cubes` (band-join · overlap-resolver · spatial mosaic), `aggregate_spatial` (+ `aggregate_spatial_*` extensions) |
 | **Per-pixel** | `apply` (sub-graph over all bands), `ndvi`, `normalized_difference` |
 | **Masking** | `mask`, `mask_scl_dilation` (per-band SCL resample), `mask_from_values` |
 | **Math (31)** | `absolute` `sqrt` `exp` `ln` `log` `power` `sgn` `floor` `ceil` `int` `round` `mod` `clip` `cos` `sin` `tan` `arccos` `arcsin` `arctan` `arctan2` … |
@@ -225,17 +225,18 @@ Unknown processes return an `UnknownProcess` error **with a Levenshtein "did you
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/.well-known/openeo` · `/` | Capabilities / version discovery |
+| `GET` | `/.well-known/openeo` · `/` · `/conformance` | Capabilities / version / conformance discovery |
 | `GET` | `/collections` · `/collections/{id}` | STAC collections (proxied from `--stac-url`) |
-| `GET` | `/processes` | Advertised process list |
-| `GET` | `/output_formats` · `/service_types` · `/udf_runtimes` | Capability docs |
-| `POST` | `/validation` | Validate a process graph without running it |
-| `POST` | `/jobs` | Create a batch job (returns `OpenEO-Identifier` header) |
-| `GET` | `/jobs/{id}` | Job status (`queued`/`running`/`finished`/`error`) |
+| `GET` | `/processes` | Advertised process list (full descriptions) |
+| `GET` | `/file_formats` · `/output_formats` · `/service_types` · `/udf_runtimes` | Capability docs (`/output_formats` is a pre-1.0 alias) |
+| `POST` | `/validation` | Validate a graph (schema **+** unsupported-process check) without running it |
+| `POST` | `/jobs` | Create a batch job (returns `OpenEO-Identifier` header; id is a v4 UUID) |
+| `GET` `PATCH` `DELETE` | `/jobs/{id}` | Job status / update / delete |
 | `POST` | `/jobs/{id}/results` | Start execution |
-| `GET` | `/jobs/{id}/results` · `/jobs/{id}/results/{asset}` | Result assets |
-| `GET` | `/jobs/{id}/estimate` | Cost/size estimate |
-| `POST` | `/credentials/basic` · `/credentials/oidc/token` | Auth |
+| `GET` | `/jobs/{id}/results` · `/jobs/{id}/results/{asset}` | Result STAC Item + assets |
+| `GET` | `/jobs/{id}/estimate` · `/jobs/{id}/logs` | Cost/size estimate · per-job log entries |
+| `GET` | `/process_graphs` · `GET`/`PUT`/`DELETE` `/process_graphs/{id}` | User-defined process graphs (UDPs) |
+| `GET` | `/credentials/basic` · `/credentials/oidc` · `POST /credentials/oidc/token` | Auth |
 | `GET` | `/me` | Authenticated user info |
 
 ---
@@ -256,7 +257,7 @@ In [`apps/orbit-openeo/examples/`](apps/orbit-openeo/examples) (all hit live Sen
 ## 🧪 Testing
 
 ```bash
-# full lib suite for the backend (515 tests)
+# full lib suite for the backend (543 tests)
 cargo test -p orbit-openeo --features geo-kernel,async-tiff-downloader --lib
 
 # whole workspace
