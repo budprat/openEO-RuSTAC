@@ -168,6 +168,15 @@ pub trait JobStore: Send + Sync {
     async fn set_status(&self, id: &str, status: JobStatus) -> Result<(), JobError>;
     /// Update progress (and bump `updated`).
     async fn set_progress(&self, id: &str, progress: f64) -> Result<(), JobError>;
+    /// Update caller-supplied metadata (`title`/`description`) for `PATCH
+    /// /jobs/{id}`. Only `Some` fields are changed; `None` leaves the existing
+    /// value untouched. Bumps `updated`. Errors `NotFound` for an absent job.
+    async fn set_metadata(
+        &self,
+        id: &str,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<(), JobError>;
     /// Delete a job by id. No-op if absent.
     async fn delete(&self, id: &str) -> Result<(), JobError>;
     /// Attach an output asset entry to a job. The bytes themselves live
@@ -272,6 +281,27 @@ impl JobStore for InMemoryJobStore {
         Ok(())
     }
 
+    async fn set_metadata(
+        &self,
+        id: &str,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<(), JobError> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let rec = g
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or_else(|| JobError::NotFound(id.into()))?;
+        if title.is_some() {
+            rec.title = title;
+        }
+        if description.is_some() {
+            rec.description = description;
+        }
+        rec.updated = Self::now();
+        Ok(())
+    }
+
     async fn delete(&self, id: &str) -> Result<(), JobError> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.retain(|r| r.id != id);
@@ -335,7 +365,12 @@ impl SqliteJobStore {
             .map_err(|e| JobError::Backend(format!("parse url: {e}")))?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
+            .synchronous(SqliteSynchronous::Normal)
+            // audit-fix (2026-06-03): without a busy_timeout, concurrent
+            // writers (the runner updating status/progress while the HTTP
+            // layer reads/writes) fail immediately with SQLITE_BUSY under WAL
+            // contention. Wait up to 5 s for the write lock instead.
+            .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(opts)
@@ -506,6 +541,33 @@ impl JobStore for SqliteJobStore {
             .await
             .map_err(|e| JobError::Backend(format!("update: {e}")))?
             .rows_affected();
+        if affected == 0 {
+            return Err(JobError::NotFound(id.into()));
+        }
+        Ok(())
+    }
+
+    async fn set_metadata(
+        &self,
+        id: &str,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> Result<(), JobError> {
+        // COALESCE(?, col): a NULL bind leaves the existing column value,
+        // a Some(..) overwrites it — matches the "only Some fields change"
+        // contract without two separate statements.
+        let affected = sqlx::query(
+            "UPDATE jobs SET title = COALESCE(?, title), \
+             description = COALESCE(?, description), updated = ? WHERE id = ?",
+        )
+        .bind(title)
+        .bind(description)
+        .bind(Self::now() as i64)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| JobError::Backend(format!("set_metadata: {e}")))?
+        .rows_affected();
         if affected == 0 {
             return Err(JobError::NotFound(id.into()));
         }

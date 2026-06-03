@@ -28,6 +28,10 @@ use crate::executor::ExecError;
 use crate::process_graph::MAX_SUBGRAPH_DEPTH;
 
 /// Result of evaluating a sub-callback against its inner-parameter bindings.
+// Intentional shared-infra scaffold: exercised by this module's tests but not
+// yet wired into the non-test binary (the per-pixel evaluators in eval_apply /
+// eval_reduce inline their own walk for performance). Retained for reuse.
+#[allow(dead_code)]
 pub type SubGraphResult = Result<Value, ExecError>;
 
 /// Evaluator for openEO process sub-graphs.
@@ -40,6 +44,7 @@ pub type SubGraphResult = Result<Value, ExecError>;
 /// Reason: keeping the trait surface minimal avoids forcing the reducer
 /// path through a per-pixel `Value` round-trip just for the sake of
 /// reuse — that would regress performance for zero invariant payoff.
+#[allow(dead_code)]
 pub trait SubGraphEvaluator {
     /// Evaluate the sub-graph rooted at `graph` against inner-parameter
     /// bindings `params`. The conventional inner-param key is `"data"`
@@ -140,8 +145,10 @@ pub fn result_process_id<'a>(
 /// throwaway pixel evaluation to surface graph-shape errors before any
 /// I/O) goes through this exact impl.
 #[derive(Debug, Default, Clone, Copy)]
+#[allow(dead_code)]
 pub struct DefaultSubGraphEvaluator;
 
+#[allow(dead_code)]
 impl SubGraphEvaluator for DefaultSubGraphEvaluator {
     fn evaluate_subgraph(
         &self,
@@ -177,6 +184,7 @@ impl SubGraphEvaluator for DefaultSubGraphEvaluator {
     }
 }
 
+#[allow(dead_code)]
 fn eval_node_value(
     id: &str,
     nodes: &Map<String, Value>,
@@ -235,6 +243,7 @@ fn eval_node_value(
     Ok(value)
 }
 
+#[allow(dead_code)]
 fn resolve_arg(
     v: &Value,
     nodes: &Map<String, Value>,
@@ -273,6 +282,7 @@ fn resolve_arg(
 /// canonical impl beyond unit tests. eval_apply.rs keeps its own
 /// per-pixel kernel for the scalar arithmetic dispatch — overlap is
 /// intentional and small (under a dozen processes).
+#[allow(dead_code)]
 fn apply_kernel(pid: &str, args: &BTreeMap<String, Value>) -> SubGraphResult {
     let data_arr = || -> Result<Vec<f64>, ExecError> {
         let d = args.get("data").ok_or_else(|| {

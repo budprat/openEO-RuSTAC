@@ -284,10 +284,26 @@ async fn main() -> Result<()> {
 
     let state = builder.build();
 
+    // audit-fix (2026-06-03): keep a handle to the in-flight job registry so we
+    // can DRAIN spawned job tasks on shutdown. axum's graceful shutdown only
+    // drains in-flight HTTP requests; batch jobs run in detached tasks and
+    // would otherwise be dropped the instant the listener stops.
+    let job_registry = state.job_registry.clone();
+
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     tracing::info!(addr = %args.bind, "orbit-openeo listening");
     axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()).await?;
+
+    // HTTP server has stopped accepting; now wait for in-flight jobs to finish
+    // (bounded). Override the budget via ORBIT_SHUTDOWN_DRAIN_SECS.
+    let drain_secs: u64 = std::env::var("ORBIT_SHUTDOWN_DRAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    job_registry
+        .drain(std::time::Duration::from_secs(drain_secs))
+        .await;
     Ok(())
 }
 

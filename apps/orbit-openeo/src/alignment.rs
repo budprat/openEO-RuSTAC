@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::datacube::{Crs, GeoTransform, RasterCube};
+use crate::datacube::{GeoTransform, RasterCube};
 
 /// Resampling strategy when bringing cubes onto a common grid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +134,7 @@ pub fn is_mask_cube(c: &RasterCube) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datacube::Crs; // used only by the test fixtures below
     use crate::datacube::{BandSpec, Coords, Dim, Provenance};
     use std::collections::BTreeMap;
 

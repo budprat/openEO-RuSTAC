@@ -65,6 +65,8 @@ pub struct StacScene {
 /// (`PathBuf::from`). For remote hrefs (HTTPS / s3:// COGs) the caller
 /// is responsible for downloading + caching first and inserting the
 /// local path back into the scene's `bands` map before resolving.
+// Retained scaffold (tested, not yet wired into the non-test binary path).
+#[allow(dead_code)]
 #[derive(Clone, Debug, Default)]
 pub struct FeatureCollection {
     /// Scenes in search order. Order matters: it becomes the time axis
@@ -72,6 +74,7 @@ pub struct FeatureCollection {
     pub scenes: Vec<StacScene>,
 }
 
+#[allow(dead_code)]
 impl FeatureCollection {
     /// Build from an owned `Vec<StacScene>`.
     #[must_use]
@@ -433,6 +436,7 @@ pub(super) fn canonical_band_name(k: &str) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn pick_asset_href(assets: &Value, candidates: &[&str]) -> Option<String> {
     for k in candidates {
         if let Some(s) = assets.get(*k).and_then(|a| a.get("href")).and_then(|h| h.as_str()) {

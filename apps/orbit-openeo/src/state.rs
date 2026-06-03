@@ -51,6 +51,9 @@ pub struct AppState {
     /// **P0-5 / P1-9**: bounded concurrency for `POST /jobs/{id}/results`
     /// spawns. Default 16; configure via `with_job_concurrency`.
     pub job_sem: Arc<tokio::sync::Semaphore>,
+    /// In-flight job task registry (cooperative cancellation + graceful
+    /// drain on shutdown). audit-fix 2026-06-03.
+    pub job_registry: Arc<crate::job_registry::JobRegistry>,
 }
 
 /// Builder for [`AppState`].
@@ -229,6 +232,7 @@ impl AppStateBuilder {
             job_sem: self
                 .job_sem
                 .unwrap_or_else(|| Arc::new(tokio::sync::Semaphore::new(16))),
+            job_registry: Arc::new(crate::job_registry::JobRegistry::new()),
         }
     }
 }

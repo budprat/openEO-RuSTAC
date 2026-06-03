@@ -24,7 +24,9 @@ members = [
 [workspace.package]
 version      = "0.1.0"
 edition      = "2024"
-rust-version = "1.85"
+# MSRV bumped 1.85 → 1.88 (2026-06-03): `time` 0.3.47 — the fix for
+# RUSTSEC-2026-0009 — requires Rust 1.88.
+rust-version = "1.88"
 license      = "MIT OR Apache-2.0"
 authors      = ["NU"]
 description  = "orbit — multi-domain Rust platform (ETL · LLM agent · satellite/geo)"
@@ -78,21 +80,21 @@ hex                = "0.4"
 reqwest            = { version = "0.13", default-features = false, features = ["json", "rustls", "gzip"] }
 
 # internal
-orbit-core         = { path = "crates/orbit-core" }
-orbit-proto        = { path = "crates/orbit-proto" }
-orbit-etl          = { path = "crates/orbit-etl" }
-eo-core              = { path = "crates/eo-core" }
-eo-io                = { path = "crates/eo-io" }
-eo-kernel            = { path = "crates/eo-kernel" }
-eo-catalog           = { path = "crates/eo-catalog" }
-eo-mask              = { path = "crates/eo-mask" }
-eo-vector            = { path = "crates/eo-vector" }
-eo-process           = { path = "crates/eo-process" }
-orbit-cache          = { path = "crates/orbit-cache" }
-orbit-resilience     = { path = "crates/orbit-resilience" }
-orbit-observability  = { path = "crates/orbit-observability" }
-orbit-config         = { path = "crates/orbit-config" }
-orbit-geo            = { path = "crates/orbit-geo" }
+orbit-core         = { path = "crates/orbit-core", version = "0.1.0" }
+orbit-proto        = { path = "crates/orbit-proto", version = "0.1.0" }
+orbit-etl          = { path = "crates/orbit-etl", version = "0.1.0" }
+eo-core              = { path = "crates/eo-core", version = "0.1.0" }
+eo-io                = { path = "crates/eo-io", version = "0.1.0" }
+eo-kernel            = { path = "crates/eo-kernel", version = "0.1.0" }
+eo-catalog           = { path = "crates/eo-catalog", version = "0.1.0" }
+eo-mask              = { path = "crates/eo-mask", version = "0.1.0" }
+eo-vector            = { path = "crates/eo-vector", version = "0.1.0" }
+eo-process           = { path = "crates/eo-process", version = "0.1.0" }
+orbit-cache          = { path = "crates/orbit-cache", version = "0.1.0" }
+orbit-resilience     = { path = "crates/orbit-resilience", version = "0.1.0" }
+orbit-observability  = { path = "crates/orbit-observability", version = "0.1.0" }
+orbit-config         = { path = "crates/orbit-config", version = "0.1.0" }
+orbit-geo            = { path = "crates/orbit-geo", version = "0.1.0" }
 
 # Phase 4 (orbit-geo) — STAC + raster stack. Uncomment when the crate lands.
 # See ../../13-geo-satellite/02-stac-sentinel2-2026.md for details.

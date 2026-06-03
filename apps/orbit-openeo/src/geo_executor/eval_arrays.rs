@@ -51,12 +51,31 @@ pub fn array_element(args: &std::collections::BTreeMap<String, Value>) -> Result
     }
 }
 
+/// Maximum materialised length for `array_create` — guards against a tiny
+/// request (`{"repeat": 1e11}`) amplifying into a multi-GB allocation that
+/// would OOM-abort the whole server (audit-fix 2026-06-03).
+const MAX_ARRAY_LEN: usize = 10_000_000;
+
 /// `array_create(data?, repeat?)` — build an array by repeating `data`
 /// `repeat` times (default 1). `data` defaults to empty.
+///
+/// The result length (`data.len() * repeat`) is bounded by [`MAX_ARRAY_LEN`]
+/// and computed with `checked_mul` so an attacker-controlled `repeat` cannot
+/// trigger an unbounded allocation / allocator abort.
 pub fn array_create(args: &std::collections::BTreeMap<String, Value>) -> Result<Value, ExecError> {
     let data = args.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let repeat = args.get("repeat").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
-    let mut out = Vec::with_capacity(data.len() * repeat as usize);
+    let total = usize::try_from(repeat)
+        .ok()
+        .and_then(|r| data.len().checked_mul(r))
+        .filter(|n| *n <= MAX_ARRAY_LEN)
+        .ok_or_else(|| {
+            ExecError::InvalidGraph(format!(
+                "array_create: result length {}×{repeat} exceeds the {MAX_ARRAY_LEN}-element cap",
+                data.len()
+            ))
+        })?;
+    let mut out = Vec::with_capacity(total);
     for _ in 0..repeat {
         out.extend(data.iter().cloned());
     }
@@ -212,6 +231,16 @@ mod tests {
     fn array_create_repeat() {
         assert_eq!(array_create(&m(json!({"data": [1, 2], "repeat": 3}))).unwrap(), json!([1,2,1,2,1,2]));
         assert_eq!(array_create(&m(json!({"data": [9]}))).unwrap(), json!([9]));
+    }
+
+    #[test]
+    fn array_create_rejects_oversized_repeat() {
+        // audit-fix: a tiny request must not amplify into an OOM allocation.
+        let r = array_create(&m(json!({"data": [1], "repeat": 100_000_000_000u64})));
+        assert!(matches!(r, Err(ExecError::InvalidGraph(_))), "huge repeat must be rejected, got {r:?}");
+        // boundary: exactly at the cap is allowed, one over is not.
+        assert!(array_create(&m(json!({"data": [0], "repeat": 10_000_000u64}))).is_ok());
+        assert!(array_create(&m(json!({"data": [0], "repeat": 10_000_001u64}))).is_err());
     }
 
     #[test]
