@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 orbit-proto        = { workspace = true }
-orbit-geo          = { path = "../../crates/orbit-geo" }
+orbit-geo          = { path = "../../crates/orbit-geo", version = "0.1.0" }
 tokio              = { workspace = true, features = ["full"] }
 tokio-stream       = { workspace = true }
 futures            = { workspace = true }

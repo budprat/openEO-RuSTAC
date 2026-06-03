@@ -159,10 +159,18 @@ async fn get_job(
 async fn update_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
-    Json(_patch): Json<Value>,
+    Json(patch): Json<Value>,
 ) -> impl IntoResponse {
-    match state.jobs.get(&job_id).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+    // audit-fix (2026-06-03): actually PERSIST the patch. Previously this
+    // returned 204 while silently discarding `title`/`description`. Only the
+    // fields present in the body are updated (openEO PATCH semantics).
+    let title = patch.get("title").and_then(|v| v.as_str()).map(str::to_string);
+    let description = patch
+        .get("description")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    match state.jobs.set_metadata(&job_id, title, description).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(JobError::NotFound(_)) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "code": "JobNotFound" })),
@@ -180,8 +188,23 @@ async fn delete_job(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {
-    let _ = state.jobs.delete(&job_id).await;
-    StatusCode::NO_CONTENT.into_response()
+    // audit-fix (2026-06-03): surface store failures instead of always
+    // reporting 204. A missing job → 404 (openEO `JobNotFound`); a real
+    // backend error → 500, so a client is never told a job was deleted when
+    // it was not.
+    match state.jobs.delete(&job_id).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(JobError::NotFound(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "code": "JobNotFound", "message": format!("job '{job_id}' not found") })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "code": "Internal", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn estimate_job(Path(_job_id): Path<String>) -> Json<Value> {
@@ -211,24 +234,44 @@ async fn start_processing(
         }
     };
 
-    // **P0-5 / P1-9**: acquire a permit before spawning so concurrent
-    // requests can't fork-bomb the runtime. The permit is held by the
-    // spawned task for its full lifetime, then dropped → permit returned.
+    // **Idempotent start (audit-fix 2026-06-03)**: re-`POST`ing results for a
+    // job that is already queued or running must NOT spawn a second runner —
+    // that double-runs the graph (double download + double compute) and
+    // corrupts progress/asset state. openEO clients that retry the start verb
+    // get a `409` instead. Created/Finished/Error/Canceled may be (re)started.
+    if matches!(rec.status, JobStatus::Queued | JobStatus::Running) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": "JobLocked",
+                "message": format!("job '{job_id}' is already {}", rec.status.as_str())
+            })),
+        )
+            .into_response();
+    }
+
+    // **P0-5 / P1-9 (audit-fix 2026-06-03)**: acquire a permit before
+    // spawning so concurrent requests can't fork-bomb the runtime. We use
+    // `try_acquire_owned` (non-blocking) so that when `job_sem` is exhausted
+    // the caller gets an immediate `503 QueueFull` instead of an unbounded
+    // queue of waiters. The permit is moved INTO the supervisor task below
+    // and is released only when `run_job` actually completes — previously it
+    // was bound to this handler's stack and dropped on return (microseconds),
+    // so the cap was never enforced (the spawned job outlived the permit).
     let sem = state.job_sem.clone();
-    let permit = match sem.clone().acquire_owned().await {
+    let permit = match sem.try_acquire_owned() {
         Ok(p) => p,
-        Err(e) => {
+        Err(_) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "code": "QueueFull", "message": e.to_string() })),
+                Json(json!({
+                    "code": "QueueFull",
+                    "message": "maximum concurrent jobs reached; retry later"
+                })),
             )
                 .into_response();
         }
     };
-    // Move the permit into the runner-spawn closure via `into_inner`-style:
-    // we forget the permit after the runner finishes by carrying it as a
-    // captured drop-guard.
-    let _job_permit_drop_guard = permit;
     let runner = runner::DefaultRunner {
         store: state.jobs.clone(),
         executor: state.executor.clone(),
@@ -237,7 +280,60 @@ async fn start_processing(
         metrics: state.metrics.clone(),
     };
     use crate::runner::JobRunner;
-    let _ = runner.spawn(job_id.clone(), rec.user_id.clone(), rec.process.clone());
+    // Supervisor task: owns the permit for the job's FULL lifetime (it awaits
+    // the inner run_job handle), races it against a cancel signal, and converts
+    // a panic into a clean `Error` transition + log. Registered in the job
+    // registry so `DELETE /results` can cancel it and graceful shutdown can
+    // drain it. (audit-fix 2026-06-03 — permit lifetime, panic supervision,
+    // cooperative cancellation, drain.)
+    let store_for_super = state.jobs.clone();
+    let registry = state.job_registry.clone();
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+    let cancel_for_task = cancel.clone();
+    let jid = job_id.clone();
+    let uid = rec.user_id.clone();
+    let body = rec.process.clone();
+    let handle = tokio::spawn(async move {
+        let _permit = permit; // released only when the job completes or cancels
+        let mut inner = runner.spawn(jid.clone(), uid, body);
+        tokio::select! {
+            // Cooperative cancellation via DELETE /jobs/{id}/results. Aborts
+            // the inner run_job at its next await point (a spawn_blocking GDAL
+            // call already in flight finishes detached, its result discarded).
+            _ = cancel_for_task.notified() => {
+                inner.abort();
+                tracing::info!(job_id = %jid, "job cancelled via DELETE /results");
+                if let Ok(rec) = store_for_super.get(&jid).await {
+                    if !matches!(
+                        rec.status,
+                        JobStatus::Finished | JobStatus::Error | JobStatus::Canceled
+                    ) {
+                        let _ = store_for_super.set_status(&jid, JobStatus::Canceled).await;
+                    }
+                }
+            }
+            joined = &mut inner => {
+                if let Err(join_err) = joined {
+                    if !join_err.is_cancelled() {
+                        tracing::error!(job_id = %jid, error = %join_err, "run_job task panicked; marking job Error");
+                        if let Ok(rec) = store_for_super.get(&jid).await {
+                            if !matches!(
+                                rec.status,
+                                JobStatus::Finished | JobStatus::Error | JobStatus::Canceled
+                            ) {
+                                let _ = store_for_super.set_status(&jid, JobStatus::Error).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        registry.deregister(&jid);
+    });
+    // Register synchronously (no await between spawn and here) so the
+    // supervisor — not polled until this handler yields — cannot deregister
+    // before this insert.
+    state.job_registry.register(job_id.clone(), cancel, handle);
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -358,10 +454,33 @@ async fn download_asset(
 }
 
 async fn discard_results(
-    State(_state): State<AppState>,
-    Path(_job_id): Path<String>,
-) -> StatusCode {
-    StatusCode::NO_CONTENT
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    // openEO `DELETE /jobs/{id}/results` = cancel processing. audit-fix
+    // (2026-06-03): previously a no-op stub that always 204'd. Now it
+    // cooperatively cancels an in-flight job (signals its supervisor) and
+    // transitions a queued/running job to `Canceled`. NB: cancellation is
+    // best-effort — a spawn_blocking GDAL call mid-flight cannot be preempted,
+    // but its result is discarded and the job is marked Canceled.
+    match state.jobs.get(&job_id).await {
+        Ok(rec) => {
+            let was_active = matches!(rec.status, JobStatus::Queued | JobStatus::Running);
+            state.job_registry.cancel(&job_id);
+            if was_active {
+                let _ = state.jobs.set_status(&job_id, JobStatus::Canceled).await;
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(JobError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json!({ "code": "JobNotFound" }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "code": "Internal", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -838,5 +957,244 @@ mod tests {
         assert_eq!(resp.status(), 404);
         let v = body_to_json(resp).await;
         assert_eq!(v["code"], "JobNotFound");
+    }
+
+    // ---- audit-fix QW2: semaphore permit is held for the job's lifetime ----
+
+    /// Executor that blocks inside `run_sync` until a gate is released, so a
+    /// started job stays in-flight (and its permit held) while the test fires
+    /// a second start request.
+    struct SlowExecutor {
+        gate: std::sync::Arc<tokio::sync::Notify>,
+    }
+    #[async_trait::async_trait]
+    impl crate::executor::ProcessGraphExecutor for SlowExecutor {
+        async fn run_sync(
+            &self,
+            _body: &Value,
+        ) -> Result<crate::executor::SyncResult, crate::executor::ExecError> {
+            self.gate.notified().await;
+            Ok(crate::executor::SyncResult::json(&json!({"ok": true})))
+        }
+        async fn enqueue(
+            &self,
+            _body: &Value,
+        ) -> Result<String, crate::executor::ExecError> {
+            Ok("noop".into())
+        }
+    }
+
+    async fn create_job(app: &axum::Router) -> String {
+        let created = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/jobs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(graph_body()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        created
+            .headers()
+            .get("openeo-identifier")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn start_job(app: &axum::Router, id: &str) -> axum::http::StatusCode {
+        app.clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/jobs/{id}/results"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_processing_holds_permit_until_job_finishes() {
+        // concurrency = 1: once one job is running, the next start must 503.
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let exec = std::sync::Arc::new(SlowExecutor { gate: gate.clone() })
+            as std::sync::Arc<dyn crate::executor::ProcessGraphExecutor>;
+        let state = AppStateBuilder::new()
+            .with_executor(exec)
+            .with_job_concurrency(1)
+            .build();
+        let app = Router::new().merge(router()).with_state(state.clone());
+
+        let j1 = create_job(&app).await;
+        let j2 = create_job(&app).await;
+
+        // Start j1 — acquires the only permit synchronously, then blocks in run_sync.
+        assert_eq!(start_job(&app, &j1).await, 202);
+        // Start j2 — permit is still held by j1's supervisor task → QueueFull.
+        assert_eq!(
+            start_job(&app, &j2).await,
+            503,
+            "second start must 503 while the only permit is held by the running job"
+        );
+
+        // Release j1: `Notify::notify_waiters()` does NOT buffer, so signal
+        // repeatedly until j1's run_sync has actually parked and woken and the
+        // job reaches a terminal state (proving its permit was returned).
+        let mut j1_done = false;
+        for _ in 0..100 {
+            gate.notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(r) = state.jobs.get(&j1).await {
+                if matches!(r.status, JobStatus::Finished | JobStatus::Error) {
+                    j1_done = true;
+                    break;
+                }
+            }
+        }
+        assert!(j1_done, "j1 should reach a terminal state once the gate is released");
+
+        // Permit is now free → j2 can start.
+        assert_eq!(
+            start_job(&app, &j2).await,
+            202,
+            "permit must be released after the first job completes"
+        );
+        gate.notify_waiters(); // let j2 drain
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn patch_job_persists_title_and_description() {
+        let state = AppStateBuilder::new().build();
+        let app = Router::new().merge(router()).with_state(state.clone());
+        let id = create_job(&app).await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/jobs/{id}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"title":"My NDVI job","description":"Wien composite"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        // GET the job and confirm the fields persisted.
+        let rec = state.jobs.get(&id).await.unwrap();
+        assert_eq!(rec.title.as_deref(), Some("My NDVI job"));
+        assert_eq!(rec.description.as_deref(), Some("Wien composite"));
+
+        // PATCH on a missing job → 404.
+        let missing = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PATCH")
+                    .uri("/jobs/job-deadbeef")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"title":"x"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), 404);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_results_cancels_running_job() {
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let exec = std::sync::Arc::new(SlowExecutor { gate: gate.clone() })
+            as std::sync::Arc<dyn crate::executor::ProcessGraphExecutor>;
+        let state = AppStateBuilder::new()
+            .with_executor(exec)
+            .with_job_concurrency(4)
+            .build();
+        let app = Router::new().merge(router()).with_state(state.clone());
+
+        let j = create_job(&app).await;
+        assert_eq!(start_job(&app, &j).await, 202);
+        // Wait until it is running (blocked in run_sync) and registered.
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if state.job_registry.in_flight() >= 1 {
+                break;
+            }
+        }
+
+        // DELETE /jobs/{id}/results = cancel.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/jobs/{j}/results"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 204);
+
+        // The job transitions to Canceled.
+        let mut canceled = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(r) = state.jobs.get(&j).await {
+                if r.status == JobStatus::Canceled {
+                    canceled = true;
+                    break;
+                }
+            }
+        }
+        gate.notify_waiters();
+        assert!(canceled, "DELETE /results must transition the job to Canceled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_processing_is_idempotent_rejects_double_start() {
+        // A second start of an already-running job must 409, not spawn a
+        // second runner (concurrency is high enough that the permit is not
+        // the limiter — this asserts the status guard specifically).
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let exec = std::sync::Arc::new(SlowExecutor { gate: gate.clone() })
+            as std::sync::Arc<dyn crate::executor::ProcessGraphExecutor>;
+        let state = AppStateBuilder::new()
+            .with_executor(exec)
+            .with_job_concurrency(4)
+            .build();
+        let app = Router::new().merge(router()).with_state(state.clone());
+
+        let j = create_job(&app).await;
+        assert_eq!(start_job(&app, &j).await, 202);
+        // Wait until the runner has marked it Running (blocked in run_sync).
+        let mut running = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            if let Ok(r) = state.jobs.get(&j).await {
+                if matches!(r.status, JobStatus::Running | JobStatus::Queued) {
+                    running = true;
+                    break;
+                }
+            }
+        }
+        assert!(running, "job should be Running/Queued after first start");
+        assert_eq!(
+            start_job(&app, &j).await,
+            409,
+            "re-starting a running job must 409 JobLocked, not double-run"
+        );
+        gate.notify_waiters();
     }
 }

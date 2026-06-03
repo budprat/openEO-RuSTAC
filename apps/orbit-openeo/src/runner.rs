@@ -140,7 +140,12 @@ pub async fn run_job(
                 });
                 return RunOutcome::Failed(format!("file_store: {e}"));
             }
-            let _ = store
+            // audit-fix (2026-06-03): do NOT swallow an add_asset failure —
+            // if the asset metadata write fails the job must not be reported
+            // Finished, otherwise GET /jobs/{id}/results returns an empty
+            // manifest for a "successful" job. Bytes are already persisted
+            // (files.put above), so this only guards the metadata record.
+            if let Err(e) = store
                 .add_asset(
                     job_id,
                     JobAsset {
@@ -149,7 +154,16 @@ pub async fn run_job(
                         size,
                     },
                 )
-                .await;
+                .await
+            {
+                let _ = store.set_status(job_id, JobStatus::Error).await;
+                bus.publish(JobEvent {
+                    user_id: user_id.to_string(),
+                    job_id: job_id.to_string(),
+                    kind: JobEventKind::Failed,
+                });
+                return RunOutcome::StoreError(format!("add_asset: {e}"));
+            }
             // phase 3: persistence done — finalise.
             let _ = store.set_progress(job_id, 95.0).await;
             bus.publish(JobEvent {

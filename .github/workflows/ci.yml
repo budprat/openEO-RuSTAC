@@ -186,8 +186,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install --locked cargo-deny
+      # audit-fix (2026-06-03): now ENFORCED — `cargo deny check` is green
+      # (advisories/bans/licenses/sources all ok), so a future RED supply
+      # chain (new advisory, copyleft license, banned crate) fails the build
+      # instead of being silently allowed.
       - run: cargo deny check
-        continue-on-error: true   # warnings allowed during stabilisation
 
   # ────────────────────────────────────────────────────────────────────────
   # api-diff — self-test + workspace parity smoke. All shell inputs are

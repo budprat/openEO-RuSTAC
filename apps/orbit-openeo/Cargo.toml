@@ -37,7 +37,7 @@ orbit-etl            = { workspace = true }
 # HTTP layer.
 axum                 = { version = "0.8", features = ["macros", "ws"] }
 tower                = "0.5"
-tower-http           = { version = "0.6", features = ["trace", "limit", "timeout"] }
+tower-http           = { version = "0.6", features = ["trace", "limit", "timeout", "catch-panic"] }
 
 # Runtime / async.
 tokio                = { workspace = true, features = ["full"] }

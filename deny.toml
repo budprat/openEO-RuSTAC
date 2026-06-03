@@ -23,11 +23,16 @@ db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/RustSec/advisory-db"]
 yanked = "warn"
 ignore = [
-    # serde_yaml 0.9.34+deprecated — known transitive dep; remediation
-    # tracked in docs/plans/01-maturity-and-parity.md (Axis A).
+    # serde_yaml 0.9.34+deprecated — known transitive dep.
     "RUSTSEC-2024-0320",
     # jsonschema 0.30 transitive (regex / referencing) — review on each
     # `cargo update`; the crate is pinned in apps/orbit-openeo/Cargo.toml.
+    # ── Unmaintained (NOT vulnerabilities), all transitive — 2026-06-03 audit.
+    # Acknowledged so the advisories gate can be enforced in CI (the real vuln,
+    # RUSTSEC-2026-0009 in `time`, was fixed by upgrading to 0.3.47).
+    "RUSTSEC-2025-0141",  # bincode (unmaintained) — via polars stack
+    "RUSTSEC-2025-0119",  # number_prefix (unmaintained) — via indicatif
+    "RUSTSEC-2025-0134",  # rustls-pemfile (unmaintained) — via reqwest/object_store
 ]
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -49,6 +54,7 @@ allow = [
     "MIT-0",
     "BSL-1.0",
     "OpenSSL",
+    "CDLA-Permissive-2.0",  # permissive data license — via `unaccent` (polars). 2026-06-03.
 ]
 # Deny anything copyleft that would taint our MIT/Apache distribution.
 # Note: LGPL is *not* in the allow list, by design. If a transitive dep
@@ -61,6 +67,10 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"   # informational; the polars stack pulls in a few
 wildcards = "deny"
+# Internal workspace crates are referenced by `{ path = ... }` (no version),
+# which cargo-deny treats as a wildcard. Allow that for path deps only — a
+# crates.io wildcard dep is still denied. 2026-06-03.
+allow-wildcard-paths = true
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"

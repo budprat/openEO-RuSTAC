@@ -70,6 +70,67 @@ pub(super) fn resolve_band_href(scene: &StacScene, band: &str) -> Option<String>
     None
 }
 
+/// **SSRF guard (audit-fix 2026-06-03)** — reject asset hrefs that could drive
+/// a server-side request forgery. COG hrefs come from STAC search responses; a
+/// malicious or compromised STAC backend (or a `--stac-url` pointed at an
+/// attacker server) could return hrefs targeting internal infrastructure —
+/// cloud metadata (IMDS `169.254.169.254`), loopback, link-local, or RFC-1918
+/// private ranges — or non-HTTP schemes (`file://`). We allow only
+/// `http(s)`/`s3` schemes to public-looking hosts.
+///
+/// This is a string-level denylist (defense-in-depth): it stops the obvious
+/// literal-IP / scheme attacks but does NOT resolve DNS, so a hostname that
+/// *resolves* to a private IP (DNS rebinding) is not caught here. For this
+/// single-tenant reference backend that trade-off is acceptable; a hardened
+/// deployment should additionally pin the STAC/asset host allowlist.
+pub(super) fn validate_asset_href(href: &str) -> Result<(), ExecError> {
+    let lower = href.to_ascii_lowercase();
+    let is_s3 = lower.starts_with("s3://");
+    let scheme_ok = lower.starts_with("https://") || lower.starts_with("http://") || is_s3;
+    if !scheme_ok {
+        return Err(ExecError::InvalidGraph(format!(
+            "load_collection: asset href scheme not allowed (only http/https/s3): {href}"
+        )));
+    }
+    // Host = substring between `://` and the next `/`, `?` or `#`; strip any
+    // `user@` credential prefix and `:port` suffix.
+    let after = href.splitn(2, "://").nth(1).unwrap_or("");
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    let h = host.trim().to_ascii_lowercase();
+
+    let blocked = h.is_empty()
+        || h == "localhost"
+        || h == "169.254.169.254"          // AWS/GCP/Azure instance metadata
+        || h == "metadata.google.internal"
+        || h.starts_with("127.")           // loopback
+        || h.starts_with("0.")
+        || h.starts_with("10.")            // RFC-1918
+        || h.starts_with("192.168.")       // RFC-1918
+        || h.starts_with("169.254.")       // link-local
+        || h.starts_with('[')              // IPv6 literal (::1, fc00::, fe80::, …)
+        || is_private_172(&h)
+        // bare hostname (no dot) ⇒ internal service name — but an `s3://`
+        // authority is a BUCKET name (legitimately dotless), so skip this rule
+        // for s3 (the IP/IMDS denylist above still applies).
+        || (!is_s3 && !h.contains('.'));
+    if blocked {
+        return Err(ExecError::InvalidGraph(format!(
+            "load_collection: asset href host '{host}' is blocked by the SSRF guard"
+        )));
+    }
+    Ok(())
+}
+
+/// True for the RFC-1918 `172.16.0.0`–`172.31.255.255` private block.
+fn is_private_172(h: &str) -> bool {
+    h.strip_prefix("172.")
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|octet| octet.parse::<u8>().ok())
+        .is_some_and(|n| (16..=31).contains(&n))
+}
+
 /// **Task #34** — convert a STAC-derived [`BandMetadata`] into the
 /// [`orbit_geo::providers::BandMetadataHint`] expected by the async-tiff
 /// downloader. Returns `None` only when the input lacks the EPSG (which
@@ -456,10 +517,16 @@ impl GeoExecutor {
                 .and_then(|v| parse_temporal(v).ok())
                 .as_deref()
                 .map(str::to_string);
+            // audit-fix (2026-06-03): clamp the scene limit. An attacker-set
+            // `limit` of millions would drive an unbounded STAC fan-out +
+            // per-(scene×band) download/compute task explosion (memory + disk
+            // DoS). 50 scenes is well beyond any real openEO temporal composite.
+            const MAX_SCENES: u64 = 50;
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(3) as u32;
+                .unwrap_or(3)
+                .clamp(1, MAX_SCENES) as u32;
             let max_cloud_cover = args
                 .get("properties")
                 .and_then(parse_eo_cloud_cover_lt);
@@ -529,6 +596,8 @@ impl GeoExecutor {
                 for (i, s) in scenes.iter().enumerate() {
                     for band in &requested_bands {
                         if let Some(href) = resolve_band_href(s, band) {
+                            // SSRF guard (P3 /vsicurl/ stream path).
+                            validate_asset_href(&href)?;
                             let vsi = vsicurl_path(&href)?;
                             let vsi_str = vsi.to_string_lossy().into_owned();
                             let dst = self.scratch_dir.join(format!("{band}_{i}_p3.vrt"));
@@ -668,6 +737,9 @@ impl GeoExecutor {
                     // check.
                     let href = resolve_band_href(s, band);
                     if let Some(href) = href {
+                        // SSRF guard: validate the STAC-supplied href host/scheme
+                        // before issuing any server-side fetch.
+                        validate_asset_href(&href)?;
                         let dst = self.scratch_dir.join(format!("{band}_{i}.tif"));
                         let band_owned = band.clone();
                         let crs_owned = crs.clone();
@@ -1006,6 +1078,32 @@ mod tests {
         assert_eq!(resolve_band_href(&scene, "B04").as_deref(), Some("https://x/red.tif"));
         // Asking for a band not present (even via alias) → None.
         assert_eq!(resolve_band_href(&scene, "B08"), None);
+    }
+
+    #[test]
+    fn validate_asset_href_allows_public_cog_blocks_ssrf() {
+        // Real sentinel-cogs hrefs must pass.
+        assert!(validate_asset_href(
+            "https://sentinel-cogs.s3.us-west-2.amazonaws.com/sentinel-s2-l2a-cogs/33/U/XP/2024/6/x.tif"
+        ).is_ok());
+        assert!(validate_asset_href("s3://sentinel-cogs/foo/bar.tif").is_ok());
+        // SSRF targets + bad schemes must be rejected.
+        for bad in [
+            "http://169.254.169.254/latest/meta-data/iam/",   // cloud IMDS
+            "https://localhost/x.tif",
+            "http://127.0.0.1:8080/x.tif",
+            "https://10.0.0.5/x.tif",                          // RFC-1918
+            "https://192.168.1.1/x.tif",
+            "https://172.16.0.1/x.tif",
+            "http://metadata.google.internal/x",
+            "file:///etc/passwd",
+            "https://internalhost/x.tif",                      // bare name, no dot
+            "https://[::1]/x.tif",                              // IPv6 loopback literal
+        ] {
+            assert!(validate_asset_href(bad).is_err(), "must block SSRF href: {bad}");
+        }
+        // A public 172.x outside the private block is allowed.
+        assert!(validate_asset_href("https://172.32.0.1/x.tif").is_ok());
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub mod typed_errors;
 pub mod url_policy;
 #[cfg(feature = "geo-kernel")]
 pub mod typed_stac;
+pub mod job_registry;
 pub mod job_store;
 pub mod process_graph;
 pub mod routes;
@@ -80,5 +81,27 @@ pub fn build_router(state: AppState) -> axum::Router {
         // 128 MiB suits openEO file uploads; clients needing larger
         // payloads should configure a higher cap via env / CLI.
         .layer(tower_http::limit::RequestBodyLimitLayer::new(128 * 1024 * 1024))
+        // audit-fix (2026-06-03): outermost panic guard. A panic in any
+        // handler (e.g. the synchronous `/result` path, which awaits the
+        // executor on the request task) becomes a clean openEO `500` instead
+        // of an aborted/reset client connection. Added LAST so it wraps the
+        // auth + body-limit layers and all routes.
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_to_500))
         .with_state(state)
+}
+
+/// Panic responder for [`tower_http::catch_panic::CatchPanicLayer`]: convert a
+/// caught panic into an openEO-shaped `500` JSON error. The panic payload is
+/// intentionally NOT echoed to the client (it may contain internal detail);
+/// the `CatchPanicLayer` logs the backtrace at `ERROR` for operators.
+fn panic_to_500(_err: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        axum::Json(serde_json::json!({
+            "code": "Internal",
+            "message": "internal server error"
+        })),
+    )
+        .into_response()
 }

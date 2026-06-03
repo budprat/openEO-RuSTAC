@@ -121,6 +121,13 @@ pub trait Recorder: Send + Sync {
     fn counter_inc(&self, name: MetricName, labels: &Labels, delta: u64);
     /// Observe one value into a histogram series.
     fn histogram_observe(&self, name: MetricName, labels: &Labels, value: f64);
+    /// Render the recorded metrics as Prometheus exposition text. Default is
+    /// empty (a recorder with no in-memory series, e.g. a pure forwarding
+    /// backend, has nothing to export here). [`InMemoryRecorder`] overrides
+    /// this to expose its stored series for the `GET /metrics` endpoint.
+    fn render_prometheus(&self) -> String {
+        String::new()
+    }
 }
 
 /// Recorder that stores series in memory. Useful for tests and unit-level
@@ -260,6 +267,10 @@ impl Recorder for InMemoryRecorder {
         let e = g.histograms.entry((name, labels.clone())).or_insert((0, 0.0));
         e.0 += 1;
         e.1 += value;
+    }
+
+    fn render_prometheus(&self) -> String {
+        self.to_prometheus()
     }
 }
 

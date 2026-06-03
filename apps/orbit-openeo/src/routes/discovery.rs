@@ -11,6 +11,35 @@ pub fn router() -> Router<AppState> {
         .route("/", get(capabilities))
         .route("/.well-known/openeo", get(well_known))
         .route("/me", get(me))
+        // audit-fix (2026-06-03): unauthenticated liveness/readiness probe for
+        // container orchestrators (k8s). Not part of the openEO spec, so it is
+        // absent from the security map → public by default (auth_layer.rs).
+        .route("/health", get(health))
+        // audit-fix (2026-06-03): Prometheus scrape endpoint. Also unmapped →
+        // public (scrapers are unauthenticated). Exposes the recorder series.
+        .route("/metrics", get(metrics))
+}
+
+/// `GET /health` — liveness/readiness probe. Returns `200 {"status":"ok"}`.
+/// Cheap and dependency-free: a `200` means the process is up and the router
+/// is serving. Intended for k8s `livenessProbe`/`readinessProbe`.
+async fn health() -> Json<Value> {
+    Json(json!({ "status": "ok" }))
+}
+
+/// `GET /metrics` — Prometheus exposition of the recorder's series
+/// (`text/plain; version=0.0.4`). Empty body when the recorder exports
+/// nothing. Intended for a Prometheus scrape job.
+async fn metrics(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> impl axum::response::IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.metrics.render_prometheus(),
+    )
 }
 
 /// `GET /` — Capabilities document per openEO 1.3.
@@ -120,6 +149,43 @@ mod tests {
     async fn body_to_json(resp: axum::http::Response<Body>) -> Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_health_returns_ok() {
+        let resp = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_to_json(resp).await;
+        assert_eq!(v["status"], "ok");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_metrics_returns_prometheus_text() {
+        let resp = app()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("text/plain"), "Prometheus content-type, got {ct}");
     }
 
     #[tokio::test(flavor = "current_thread")]

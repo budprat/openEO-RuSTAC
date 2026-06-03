@@ -372,6 +372,9 @@ impl GeoExecutor {
     /// download semaphore. Limits parallelism to `download_sem`'s
     /// permits (default 8) so a many-scene job can't fork-bomb the
     /// host.
+    // Only called from the `not(async-tiff-downloader)` download path; under
+    // the default feature combo the `_with_meta` variant is used instead.
+    #[allow(dead_code)]
     pub(super) async fn fetch_with_cache_async(
         &self,
         href: String,
@@ -913,7 +916,7 @@ fn raster_to_png_bytes(tiff_path: &Path) -> Result<Vec<u8>, ExecError> {
     // MEM driver → in-memory u8 dataset.
     let mem_drv = DriverManager::get_driver_by_name("MEM")
         .map_err(|e| ExecError::Backend(format!("png: MEM driver: {e}")))?;
-    let mut mem_ds = mem_drv
+    let mem_ds = mem_drv
         .create_with_band_type::<u8, _>("", cols, rows, 1)
         .map_err(|e| ExecError::Backend(format!("png: mem create: {e}")))?;
     {
