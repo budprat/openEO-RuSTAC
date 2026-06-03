@@ -105,7 +105,7 @@ carries an ETL foundation (`orbit-etl` + CLI/gRPC server) — see [Monorepo layo
 ### 1. Build (with the P2-full streaming downloader)
 
 ```bash
-cd /Users/macbookpro/Rust_Sentinel/mvp/orbit-etl
+cd path/to/orbit-etl
 cargo build -p orbit-openeo --features async-tiff-downloader
 # binary: ./target/debug/orbit-openeo
 ```
