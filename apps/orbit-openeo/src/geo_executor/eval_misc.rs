@@ -217,6 +217,158 @@ impl GeoExecutor {
         Ok(json!({ "__cube": Value::Object(out) }))
     }
 
+    /// openEO standard `aggregate_spatial(data, geometries, reducer)` (M3,
+    /// process audit). Previously only the orbit extensions
+    /// `aggregate_spatial_polygon`/`_point` existed, so a client calling the
+    /// spec process got `UnknownProcess`.
+    ///
+    /// For each input geometry (GeoJSON polygon, world coords assumed
+    /// EPSG:4326) and each scene of the cube's primary band, the geometry is
+    /// reprojected into the raster CRS, rasterised, and the inside-pixel
+    /// values are collapsed with the `reducer` callback. Returns a vector-cube
+    /// JSON: `data[geometry_index][scene_index]`.
+    ///
+    /// v1 scope: a single statistical `reducer` (mean/min/max/sum/median/
+    /// count/first/last/sd/variance); compound reducer callbacks are rejected.
+    pub(super) fn eval_aggregate_spatial(
+        &self,
+        mut args: std::collections::BTreeMap<String, Value>,
+    ) -> Result<Value, ExecError> {
+        use eo_vector::{PolygonRing, Rasterizer, ScanlineRasterizer};
+        use gdal::spatial_ref::{AxisMappingStrategy, CoordTransform, SpatialRef};
+
+        let reducer_val = args.get("reducer").ok_or_else(|| {
+            ExecError::InvalidGraph("aggregate_spatial: missing `reducer` callback".into())
+        })?;
+        let red = match parse_reducer_subgraph(reducer_val)? {
+            ReducerKind::Builtin(r) => r,
+            ReducerKind::SubGraph(_) => {
+                return Err(ExecError::InvalidGraph(
+                    "aggregate_spatial: compound reducer callbacks are not supported; \
+                     use a single statistical reducer (mean/min/max/sum/median/count/…)".into(),
+                ))
+            }
+        };
+        let geometries = args.get("geometries").ok_or_else(|| {
+            ExecError::InvalidGraph("aggregate_spatial: missing `geometries`".into())
+        })?;
+        let rings_world = collect_exterior_rings(geometries);
+        if rings_world.is_empty() {
+            return Err(ExecError::InvalidGraph(
+                "aggregate_spatial: no polygon geometries found (expected GeoJSON polygons)".into(),
+            ));
+        }
+        let data = args.remove("data").ok_or_else(|| {
+            ExecError::InvalidGraph("aggregate_spatial: missing `data`".into())
+        })?;
+        let mut cube = DataCube::from_envelope_owned(data).map_err(|e| {
+            ExecError::InvalidGraph(format!("aggregate_spatial: input is not a cube: {e}"))
+        })?;
+        // Primary band: a canonical index band if present, else first non-SCL.
+        const F32_INDEX_BANDS: &[&str] = &["ndvi", "ndmi", "ndwi", "evi", "savi", "msavi"];
+        let band_key: String = F32_INDEX_BANDS
+            .iter()
+            .find(|k| cube.bands.contains_key(**k))
+            .map(|s| s.to_string())
+            .or_else(|| cube.bands.keys().find(|k| k.as_str() != "SCL").cloned())
+            .ok_or_else(|| ExecError::InvalidGraph(
+                "aggregate_spatial: cube has no usable band".into(),
+            ))?;
+        let paths = cube.take_band(&band_key).map_err(|_| {
+            ExecError::Backend(format!("aggregate_spatial: band `{band_key}` vanished"))
+        })?;
+
+        // data[geometry_index][scene_index].
+        let mut data_out: Vec<Vec<Value>> = vec![Vec::with_capacity(paths.len()); rings_world.len()];
+
+        for path in &paths {
+            let ds = gdal::Dataset::open(path)
+                .map_err(|e| ExecError::Backend(format!("aggregate_spatial: open {}: {e}", path.display())))?;
+            let gt = ds.geo_transform()
+                .map_err(|e| ExecError::Backend(format!("aggregate_spatial: geo_transform: {e}")))?;
+            let band = ds.rasterband(1)
+                .map_err(|e| ExecError::Backend(format!("aggregate_spatial: rasterband: {e}")))?;
+            let (cols, rows) = band.size();
+            let buf: gdal::raster::Buffer<f32> = band
+                .read_as::<f32>((0, 0), (cols, rows), (cols, rows), None)
+                .map_err(|e| ExecError::Backend(format!("aggregate_spatial: read: {e}")))?;
+            let raster: Vec<f32> = buf.into_shape_and_vec().1;
+
+            // Transform EPSG:4326 → raster CRS (skip if the raster is already
+            // geographic / has no spatial ref).
+            let mut raster_sr = ds.spatial_ref().ok();
+            let xform = if let Some(sr) = raster_sr.as_mut() {
+                sr.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+                let mut src = SpatialRef::from_epsg(4326)
+                    .map_err(|e| ExecError::Backend(format!("aggregate_spatial: epsg4326: {e}")))?;
+                src.set_axis_mapping_strategy(AxisMappingStrategy::TraditionalGisOrder);
+                Some(CoordTransform::new(&src, sr)
+                    .map_err(|e| ExecError::Backend(format!("aggregate_spatial: CoordTransform: {e}")))?)
+            } else {
+                None
+            };
+
+            let (pix_w, pix_h) = (gt[1], gt[5]);
+            if pix_w == 0.0 || pix_h == 0.0 {
+                return Err(ExecError::Backend(
+                    "aggregate_spatial: degenerate geo_transform".into(),
+                ));
+            }
+
+            for (gi, ring_world) in rings_world.iter().enumerate() {
+                // World (lon,lat) → raster CRS → pixel (col,row).
+                let mut xs: Vec<f64> = ring_world.iter().map(|(x, _)| *x).collect();
+                let mut ys: Vec<f64> = ring_world.iter().map(|(_, y)| *y).collect();
+                if let Some(xf) = &xform {
+                    let mut zs = vec![0.0f64; xs.len()];
+                    if let Err(e) = xf.transform_coords(&mut xs, &mut ys, &mut zs) {
+                        return Err(ExecError::Backend(format!("aggregate_spatial: transform_coords: {e}")));
+                    }
+                }
+                let verts: Vec<(f64, f64)> = xs
+                    .iter()
+                    .zip(ys.iter())
+                    .map(|(&x, &y)| ((x - gt[0]) / pix_w, (y - gt[3]) / pix_h))
+                    .collect();
+                let pix_ring = PolygonRing { vertices: verts };
+                let value = if pix_ring.is_valid() {
+                    match ScanlineRasterizer.rasterise(&pix_ring, rows, cols) {
+                        Ok(mask) => {
+                            let mut vals: Vec<f32> = mask
+                                .iter()
+                                .zip(raster.iter())
+                                .filter(|(&m, &v)| m == 1 && v.is_finite() && v != SENTINEL_NDVI_NA)
+                                .map(|(_, &v)| v)
+                                .collect();
+                            if vals.is_empty() {
+                                Value::Null
+                            } else {
+                                let r = apply_reducer(&mut vals, red);
+                                serde_json::Number::from_f64(r as f64)
+                                    .map(Value::Number)
+                                    .unwrap_or(Value::Null)
+                            }
+                        }
+                        Err(_) => Value::Null,
+                    }
+                } else {
+                    Value::Null
+                };
+                data_out[gi].push(value);
+            }
+        }
+
+        Ok(json!({
+            "aggregate_spatial": {
+                "band": band_key,
+                "reducer": red.name(),
+                "geometry_count": rings_world.len(),
+                "scene_count": paths.len(),
+                "data": data_out,
+            }
+        }))
+    }
+
     /// orbit-extension `aggregate_spatial_point` — sample raster values
     /// at world-coordinate points via `orbit_geo::sampling::sample`.
     /// `data` is a __raster handle; `points` is an array of `[x, y]`.
@@ -479,10 +631,15 @@ impl GeoExecutor {
     }
 
     /// openEO `resample_spatial` — reproject a cube to a target EPSG via
-    /// `orbit_geo::gdal_utils::warp`. The output is a new GeoTIFF whose
-    /// path is surfaced as a `__raster` handle. `save_result` can hand
-    /// the bytes back directly; `ndvi`/other downstream processes accept
-    /// a single-band raster handle as a degenerate one-scene cube.
+    /// `orbit_geo::gdal_utils::warp`.
+    ///
+    /// **M2 (process audit)**: previously warped only the FIRST band of the
+    /// FIRST scene and dropped the rest. It now reprojects EVERY (band, scene)
+    /// raster and returns a `__cube` preserving the band map (one warped file
+    /// per scene per band). A `__raster` input still returns a single
+    /// `__raster` (back-compat). `resolution` is not yet supported by the
+    /// underlying warp helper; supplying a non-zero `resolution` is rejected
+    /// rather than silently ignored.
     pub(super) fn eval_resample_spatial(
         &self,
         mut args: std::collections::BTreeMap<String, Value>,
@@ -493,65 +650,188 @@ impl GeoExecutor {
             .ok_or_else(|| ExecError::InvalidGraph(
                 "resample_spatial: numeric `projection` (EPSG code) is required".into(),
             ))? as u32;
-        let mut data = args
+        // Reject a non-zero `resolution` instead of silently ignoring it
+        // (same silent-wrong-answer class as the filter_* no-ops).
+        if let Some(res) = args.get("resolution") {
+            let nonzero = match res {
+                Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                Value::Array(a) => a.iter().any(|v| v.as_f64().map(|f| f != 0.0).unwrap_or(false)),
+                _ => false,
+            };
+            if nonzero {
+                return Err(ExecError::InvalidGraph(
+                    "resample_spatial: `resolution` is not supported by this backend \
+                     (projection-only reprojection); omit it or set it to 0".into(),
+                ));
+            }
+        }
+        let data = args
             .remove("data")
             .ok_or_else(|| ExecError::InvalidGraph("resample_spatial: missing `data`".into()))?;
 
-        // Source path: either a __raster handle (single GeoTIFF) or the
-        // first red_path of a __cube (we warp one band as a sentinel; a
-        // full per-scene reproject lands when openEO `apply_dimension`
-        // wires up batch warp). Take by value to avoid cloning the
-        // band paths array.
-        let src_path: PathBuf = if let Some(raster) = data
-            .as_object_mut()
-            .and_then(|m| m.remove("__raster"))
-        {
+        let warp_one = |src: &PathBuf, tag: &str| -> Result<PathBuf, ExecError> {
+            let dst = self.scratch_dir.join(format!(
+                "warp_epsg{target_epsg}_{tag}_{}.tif",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            orbit_geo::gdal_utils::warp(src, &dst, target_epsg)
+                .map_err(|e| ExecError::Backend(format!("resample_spatial: warp {tag}: {e}")))
+        };
+
+        // __raster input → single warped __raster (back-compat).
+        if let Some(raster) = data.get("__raster") {
             let path_val = raster
-                .as_object()
-                .and_then(|m| m.get("path"))
+                .get("path")
                 .cloned()
                 .ok_or_else(|| ExecError::InvalidGraph(
                     "resample_spatial: __raster missing `path`".into(),
                 ))?;
-            serde_json::from_value(path_val).map_err(|e| {
+            let src_path: PathBuf = serde_json::from_value(path_val).map_err(|e| {
                 ExecError::InvalidGraph(format!("resample_spatial: bad raster.path: {e}"))
-            })?
-        } else if data.get("__cube").is_some() {
-            // Band-flexible: pick the first band's first scene from `bands`.
+            })?;
+            let warped = warp_one(&src_path, "r")?;
+            return Ok(json!({
+                "__raster": {
+                    "path": warped,
+                    "media_type": "image/tiff",
+                    "produced_by": "resample_spatial",
+                    "target_epsg": target_epsg,
+                }
+            }));
+        }
+
+        // __cube input → warp every (band, scene), preserve the band map.
+        if data.get("__cube").is_some() {
             let mut cube = DataCube::from_envelope_owned(data).map_err(|e| {
                 ExecError::InvalidGraph(format!("resample_spatial: bad __cube: {e}"))
             })?;
-            let (_first_band, paths) = std::mem::take(&mut cube.bands)
-                .into_iter()
-                .next()
-                .ok_or_else(|| ExecError::Backend(
+            if cube.bands.is_empty() {
+                return Err(ExecError::Backend(
                     "resample_spatial: __cube.bands is empty".into(),
-                ))?;
-            paths.into_iter().next().ok_or_else(|| {
-                ExecError::Backend("resample_spatial: empty band paths".into())
-            })?
-        } else {
-            return Err(ExecError::InvalidGraph(
-                "resample_spatial: `data` must be a __raster or __cube handle".into(),
-            ));
-        };
-        let dst = self.scratch_dir.join(format!(
-            "warp_epsg{target_epsg}_{}.tif",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let warped = orbit_geo::gdal_utils::warp(&src_path, &dst, target_epsg)
-            .map_err(|e| ExecError::Backend(format!("resample_spatial: warp: {e}")))?;
-        Ok(json!({
-            "__raster": {
-                "path": warped,
-                "media_type": "image/tiff",
-                "produced_by": "resample_spatial",
-                "target_epsg": target_epsg,
+                ));
             }
-        }))
+            let band_keys: Vec<String> = cube.bands.keys().cloned().collect();
+            for band_key in &band_keys {
+                let paths = cube.take_band(band_key).map_err(|_| {
+                    ExecError::Backend(format!("resample_spatial: band `{band_key}` vanished"))
+                })?;
+                let mut out_paths: Vec<PathBuf> = Vec::with_capacity(paths.len());
+                for (t, src) in paths.iter().enumerate() {
+                    out_paths.push(warp_one(src, &format!("{band_key}_t{t}"))?);
+                }
+                cube.bands.insert(band_key.clone(), out_paths);
+            }
+            // Reprojection invalidates the stored EPSG:4326 bbox; clear it so
+            // downstream consumers re-derive from the warped rasters.
+            cube.bbox = None;
+            cube.extras.insert("target_epsg".into(), Value::from(target_epsg));
+            return Ok(cube.to_envelope());
+        }
+
+        Err(ExecError::InvalidGraph(
+            "resample_spatial: `data` must be a __raster or __cube handle".into(),
+        ))
+    }
+}
+
+/// Extract exterior rings (as `Vec<(x, y)>`) from a GeoJSON value. Handles
+/// `Polygon`, `MultiPolygon`, `Feature`, `FeatureCollection`,
+/// `GeometryCollection`, an openEO geometries array, and a bare coordinates
+/// array. Only the exterior ring (first ring) of each polygon is used —
+/// holes are ignored in this v1.
+fn collect_exterior_rings(v: &Value) -> Vec<Vec<(f64, f64)>> {
+    let mut out: Vec<Vec<(f64, f64)>> = Vec::new();
+    collect_rings_inner(v, &mut out);
+    out
+}
+
+/// True if `v` is a `[x, y, ...]` coordinate pair.
+fn is_coord_pair(v: &Value) -> bool {
+    matches!(v, Value::Array(a) if a.len() >= 2 && a[0].is_number() && a[1].is_number())
+}
+
+/// A linear ring is an array of coordinate pairs (`[[x,y], [x,y], ...]`).
+fn ring_from_value(v: &Value) -> Option<Vec<(f64, f64)>> {
+    let arr = v.as_array()?;
+    if arr.len() < 3 || !arr.iter().all(is_coord_pair) {
+        return None;
+    }
+    Some(
+        arr.iter()
+            .filter_map(|p| {
+                let a = p.as_array()?;
+                Some((a[0].as_f64()?, a[1].as_f64()?))
+            })
+            .collect(),
+    )
+}
+
+fn collect_rings_inner(v: &Value, out: &mut Vec<Vec<(f64, f64)>>) {
+    match v {
+        Value::Object(map) => {
+            let kind = map.get("type").and_then(|t| t.as_str());
+            match kind {
+                Some("Polygon") => {
+                    // coordinates = [ exterior_ring, hole1, ... ]
+                    if let Some(rings) = map.get("coordinates").and_then(|c| c.as_array()) {
+                        if let Some(ext) = rings.first().and_then(ring_from_value) {
+                            out.push(ext);
+                        }
+                    }
+                }
+                Some("MultiPolygon") => {
+                    if let Some(polys) = map.get("coordinates").and_then(|c| c.as_array()) {
+                        for poly in polys {
+                            if let Some(ext) = poly.as_array().and_then(|r| r.first()).and_then(ring_from_value) {
+                                out.push(ext);
+                            }
+                        }
+                    }
+                }
+                Some("Feature") => {
+                    if let Some(g) = map.get("geometry") {
+                        collect_rings_inner(g, out);
+                    }
+                }
+                Some("FeatureCollection") => {
+                    if let Some(feats) = map.get("features").and_then(|f| f.as_array()) {
+                        for f in feats {
+                            collect_rings_inner(f, out);
+                        }
+                    }
+                }
+                Some("GeometryCollection") => {
+                    if let Some(geoms) = map.get("geometries").and_then(|g| g.as_array()) {
+                        for g in geoms {
+                            collect_rings_inner(g, out);
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown object — try a bare `coordinates` array
+                    // (interpreted as a single polygon's ring set).
+                    if let Some(rings) = map.get("coordinates").and_then(|c| c.as_array()) {
+                        if let Some(ext) = rings.first().and_then(ring_from_value) {
+                            out.push(ext);
+                        }
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            // A bare ring `[[x,y],...]`, or an array of geometries.
+            if let Some(ring) = ring_from_value(v) {
+                out.push(ring);
+            } else {
+                for inner in arr {
+                    collect_rings_inner(inner, out);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -854,6 +1134,82 @@ mod tests {
         let m = means[0].as_f64().unwrap();
         assert!((m - 3.5).abs() < 0.1, "expected ~3.5 got {m}");
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn collect_exterior_rings_parses_geojson_shapes() {
+        // Polygon.
+        let poly = json!({"type":"Polygon","coordinates":[[[0.0,0.0],[2.0,0.0],[2.0,2.0],[0.0,0.0]]]});
+        assert_eq!(super::collect_exterior_rings(&poly).len(), 1);
+        // Feature wrapping a polygon.
+        let feat = json!({"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]]}});
+        assert_eq!(super::collect_exterior_rings(&feat).len(), 1);
+        // FeatureCollection with two features.
+        let fc = json!({"type":"FeatureCollection","features":[feat.clone(), feat]});
+        assert_eq!(super::collect_exterior_rings(&fc).len(), 2);
+        // Non-polygon → none.
+        assert!(super::collect_exterior_rings(&json!({"type":"Point","coordinates":[1.0,1.0]})).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aggregate_spatial_reduces_per_geometry_with_reducer() {
+        // M3: standard aggregate_spatial. 4x4 EPSG:4326 raster, values 1..16.
+        // A world polygon over the top-left 2x2 with reducer=mean → 3.5.
+        let scratch = temp_root("agg-spatial");
+        let path = scratch.join("ndvi.tif");
+        let driver = gdal::DriverManager::get_driver_by_name("GTiff").unwrap();
+        let mut ds = driver.create_with_band_type::<f32, _>(&path, 4, 4, 1).unwrap();
+        // origin (0,4), pixel (1,-1): world x∈[0,4], y∈[0,4]; row0 is y∈[3,4].
+        ds.set_geo_transform(&[0.0, 1.0, 0.0, 4.0, 0.0, -1.0]).unwrap();
+        let srs = gdal::spatial_ref::SpatialRef::from_epsg(4326).unwrap();
+        ds.set_spatial_ref(&srs).unwrap();
+        let mut band = ds.rasterband(1).unwrap();
+        let data: Vec<f32> = (1..=16i32).map(|v| v as f32).collect();
+        let mut buf = gdal::raster::Buffer::new((4, 4), data);
+        band.write::<f32>((0, 0), (4, 4), &mut buf).unwrap();
+        drop(band); drop(ds);
+
+        let exe = GeoExecutor::new().with_scratch_dir(scratch.clone());
+        let body = graph(json!({
+            "a": { "process_id": "aggregate_spatial",
+                   "arguments": {
+                       "data": { "__cube": { "bands": { "ndvi": [path.to_str().unwrap()] } } },
+                       // World polygon over top-left 2x2 (x∈[0,2], y∈[2,4]).
+                       "geometries": { "type": "Polygon",
+                           "coordinates": [[[0.0,2.0],[2.0,2.0],[2.0,4.0],[0.0,4.0],[0.0,2.0]]] },
+                       "reducer": { "process_graph": {
+                           "m": { "process_id": "mean", "arguments": {"data": {"from_parameter": "data"}}, "result": true }
+                       }}
+                   },
+                   "result": true }
+        }));
+        let r = exe.run_sync(&body).await.unwrap();
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        let agg = &v["aggregate_spatial"];
+        assert_eq!(agg["geometry_count"], 1);
+        assert_eq!(agg["scene_count"], 1);
+        let val = agg["data"][0][0].as_f64().unwrap();
+        assert!((val - 3.5).abs() < 0.1, "expected ~3.5, got {val}");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aggregate_spatial_rejects_compound_reducer() {
+        let body = graph(json!({
+            "a": { "process_id": "aggregate_spatial",
+                   "arguments": {
+                       "data": { "__cube": { "bands": { "ndvi": ["/tmp/x.tif"] } } },
+                       "geometries": { "type": "Polygon", "coordinates": [[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]] },
+                       "reducer": { "process_graph": {
+                           "mx": {"process_id":"max","arguments":{"data":{"from_parameter":"data"}}},
+                           "mn": {"process_id":"min","arguments":{"data":{"from_parameter":"data"}}},
+                           "rng": {"process_id":"subtract","arguments":{"x":{"from_node":"mx"},"y":{"from_node":"mn"}},"result":true}
+                       }}
+                   },
+                   "result": true }
+        }));
+        let r = GeoExecutor::new().run_sync(&body).await;
+        assert!(matches!(r, Err(ExecError::InvalidGraph(_))));
     }
 
     #[tokio::test(flavor = "current_thread")]

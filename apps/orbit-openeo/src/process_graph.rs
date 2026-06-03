@@ -205,6 +205,59 @@ where
     Ok(())
 }
 
+/// **M4 (process audit)** — collect every `process_id` referenced anywhere
+/// in a raw process-graph JSON value, INCLUDING those nested inside
+/// sub-callback `process_graph`s (`reducer` / `process` / `overlap_resolver`
+/// / `mask`). Unlike the topological walker, callback ids ARE collected here
+/// because an unknown process in a callback is just as unsupported as one at
+/// the top level — we want to reject it at submit/validate time, not only
+/// when the runner reaches it.
+///
+/// Accepts either the full submission body (`{"process": {"process_graph":
+/// …}}`), the `{"process_graph": …}` wrapper, or a bare node map.
+pub fn collect_process_ids(body: &Value) -> std::collections::BTreeSet<String> {
+    fn walk(v: &Value, depth: usize, out: &mut std::collections::BTreeSet<String>) {
+        if depth > MAX_SUBGRAPH_DEPTH {
+            return;
+        }
+        match v {
+            Value::Object(map) => {
+                if let Some(Value::String(pid)) = map.get("process_id") {
+                    out.insert(pid.clone());
+                }
+                for inner in map.values() {
+                    walk(inner, depth + 1, out);
+                }
+            }
+            Value::Array(arr) => {
+                for inner in arr {
+                    walk(inner, depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let pg = body
+        .get("process")
+        .and_then(|p| p.get("process_graph"))
+        .or_else(|| body.get("process_graph"))
+        .unwrap_or(body);
+    let mut out = std::collections::BTreeSet::new();
+    walk(pg, 0, &mut out);
+    out
+}
+
+/// **M4** — return the sorted list of referenced process ids that are NOT in
+/// `known` (the implemented set, e.g. `process_catalog::process_ids()`).
+/// Empty when every referenced process is supported.
+pub fn unsupported_process_ids(body: &Value, known: &[&str]) -> Vec<String> {
+    let known: std::collections::HashSet<&str> = known.iter().copied().collect();
+    collect_process_ids(body)
+        .into_iter()
+        .filter(|id| !known.contains(id.as_str()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +568,44 @@ mod tests {
             }
             other => panic!("expected DepthExceeded, got {other:?}"),
         }
+    }
+
+    // ---------- M4: process-id collection + unsupported detection ----------
+
+    #[test]
+    fn collect_process_ids_includes_callback_processes() {
+        // Top-level reduce_dimension + an inner `mean` reducer callback.
+        let body = serde_json::json!({
+            "process": { "process_graph": {
+                "load": { "process_id": "load_collection", "arguments": {} },
+                "r": { "process_id": "reduce_dimension", "arguments": {
+                    "data": { "from_node": "load" },
+                    "reducer": { "process_graph": {
+                        "m": { "process_id": "mean", "arguments": { "data": { "from_parameter": "data" } }, "result": true }
+                    }}
+                }, "result": true }
+            }}
+        });
+        let ids = collect_process_ids(&body);
+        assert!(ids.contains("load_collection"));
+        assert!(ids.contains("reduce_dimension"));
+        assert!(ids.contains("mean"), "callback process ids must be collected");
+    }
+
+    #[test]
+    fn unsupported_process_ids_flags_unknown_only() {
+        let body = serde_json::json!({
+            "process_graph": {
+                "a": { "process_id": "add", "arguments": { "x": 1, "y": 2 } },
+                "z": { "process_id": "frobnicate", "arguments": {}, "result": true }
+            }
+        });
+        let known = ["add", "subtract", "save_result"];
+        let bad = unsupported_process_ids(&body, &known);
+        assert_eq!(bad, vec!["frobnicate".to_string()]);
+        // All-known graph → empty.
+        let ok = unsupported_process_ids(&body, &["add", "frobnicate"]);
+        assert!(ok.is_empty());
     }
 
     #[test]

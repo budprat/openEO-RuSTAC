@@ -51,7 +51,15 @@ async fn get_collection(
 }
 
 async fn list_processes() -> Json<Value> {
-    Json(json!({ "processes": [], "links": [] }))
+    // H1 (process audit): advertise the implemented process set. The openEO
+    // API requires `/processes` to list every supported process with its
+    // description; the previous `[]` stub made clients believe the backend
+    // supported nothing. Source of truth is `process_catalog` (kept in
+    // lock-step with the runtime registry by a geo-kernel test).
+    Json(json!({
+        "processes": crate::process_catalog::process_descriptions(),
+        "links": [],
+    }))
 }
 
 async fn list_output_formats() -> Json<Value> {
@@ -96,6 +104,28 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["code"], "CollectionNotFound");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_processes_advertises_implemented_set() {
+        // H1 regression: `/processes` must NOT be empty and must describe
+        // real processes (id + parameters + returns) so openEO clients can
+        // discover capabilities.
+        let resp = app()
+            .oneshot(axum::http::Request::builder().uri("/processes").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let procs = v["processes"].as_array().expect("processes array");
+        assert!(procs.len() >= 60, "expected the full implemented set, got {}", procs.len());
+        let ids: Vec<&str> = procs.iter().filter_map(|p| p["id"].as_str()).collect();
+        assert!(ids.contains(&"ndvi"));
+        assert!(ids.contains(&"reduce_dimension"));
+        assert!(ids.contains(&"load_collection"));
+        // Each entry is spec-shaped.
+        assert!(procs[0].get("parameters").and_then(|p| p.as_array()).is_some());
+        assert!(procs[0].get("returns").is_some());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -90,14 +90,13 @@ fn resolve_arg_value(
         return Ok(ArgVal::Num(n));
     }
     if let Some(obj) = v.as_object() {
-        // `from_parameter: "x"` → the per-pixel value.
-        if let Some(Value::String(p)) = obj.get("from_parameter") {
-            if p == "x" {
-                return Ok(ArgVal::Num(x));
-            }
-            return Err(ExecError::InvalidGraph(format!(
-                "apply: unsupported sub-process parameter `{p}` (only `x` is bound)"
-            )));
+        // `from_parameter: "<name>"` → the per-pixel value. openEO's `apply`
+        // callback declares a single data parameter (conventionally `x`); we
+        // bind WHATEVER name the callback uses to the pixel value so graphs
+        // authored with a different parameter name (L1, process audit) work
+        // instead of erroring.
+        if obj.get("from_parameter").and_then(|v| v.as_str()).is_some() {
+            return Ok(ArgVal::Num(x));
         }
         // `from_node: "<id>"` → recurse.
         if let Some(Value::String(target)) = obj.get("from_node") {
@@ -302,6 +301,61 @@ fn apply_pure_numeric_op(
                 ));
             }
             (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+        }
+
+        // M1 (process audit): the apply kernel previously supported a
+        // SMALLER set than the top-level registry, so a callback using e.g.
+        // `normalized_difference` or `arctan` failed. These arms close that
+        // gap — the apply / reduce sub-evaluators and the registry now accept
+        // the same pure-numeric process set.
+        "mod" => { let (x, y) = two("mod")?; x - y * (x / y).floor() }
+        "sgn" | "sign" => one("sgn")?.signum(),
+        "floor" => one("floor")?.floor(),
+        "ceil" => one("ceil")?.ceil(),
+        "int" => one("int")?.trunc(),
+        "round" => {
+            let x = one("round")?;
+            let p = args.get("p").and_then(|v| v.as_num("p").ok()).unwrap_or(0.0);
+            let factor = 10f64.powi(p as i32);
+            (x * factor).round_ties_even() / factor
+        }
+        "sqrt" => one("sqrt")?.sqrt(),
+        "normalized_difference" => {
+            let (x, y) = two("normalized_difference")?;
+            let denom = x + y;
+            if denom == 0.0 {
+                return Err(ExecError::PerPixelComputation(
+                    "apply: normalized_difference x + y == 0".into(),
+                ));
+            }
+            (x - y) / denom
+        }
+        "between" => {
+            let x = args.get("x").or_else(|| args.get("data"))
+                .ok_or_else(|| ExecError::InvalidGraph("apply: `between` needs `x`".into()))?
+                .as_num("x")?;
+            let lo = args.get("min")
+                .ok_or_else(|| ExecError::InvalidGraph("apply: `between` needs `min`".into()))?
+                .as_num("min")?;
+            let hi = args.get("max")
+                .ok_or_else(|| ExecError::InvalidGraph("apply: `between` needs `max`".into()))?
+                .as_num("max")?;
+            if x >= lo && x <= hi { 1.0 } else { 0.0 }
+        }
+        "cos" => one("cos")?.cos(),
+        "sin" => one("sin")?.sin(),
+        "tan" => one("tan")?.tan(),
+        "arccos" => one("arccos")?.acos(),
+        "arcsin" => one("arcsin")?.asin(),
+        "arctan" => one("arctan")?.atan(),
+        "arctan2" => {
+            // spec param names (y, x); also accept data:[y, x].
+            if let (Some(y), Some(x)) = (args.get("y"), args.get("x")) {
+                y.as_num("y")?.atan2(x.as_num("x")?)
+            } else {
+                let (y, x) = two("arctan2")?;
+                y.atan2(x)
+            }
         }
 
         other => {
@@ -669,6 +723,44 @@ mod tests {
             }
             other => panic!("expected PerPixelComputation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn eval_apply_subgraph_supports_extended_math_set() {
+        // M1: these processes were previously rejected inside `apply` even
+        // though they're registered at top level. Lock them in.
+        // normalized_difference(x=8, y=4) over pixel x=8 with y literal 4.
+        let nd = json!({
+            "n": { "process_id": "normalized_difference",
+                   "arguments": { "x": { "from_parameter": "x" }, "y": 4 }, "result": true }
+        });
+        assert!((eval_apply_subgraph(&nd, 8.0).unwrap() - (4.0/12.0)).abs() < 1e-6);
+        // arctan(1) = pi/4.
+        let at = json!({ "a": { "process_id": "arctan",
+            "arguments": { "x": { "from_parameter": "x" } }, "result": true } });
+        assert!((eval_apply_subgraph(&at, 1.0).unwrap() - std::f64::consts::FRAC_PI_4).abs() < 1e-6);
+        // floor(2.9) = 2.
+        let fl = json!({ "f": { "process_id": "floor",
+            "arguments": { "x": { "from_parameter": "x" } }, "result": true } });
+        assert!((eval_apply_subgraph(&fl, 2.9).unwrap() - 2.0).abs() < 1e-9);
+        // mod(7, 3) = 1 ; mod sign follows divisor.
+        let md = json!({ "m": { "process_id": "mod",
+            "arguments": { "x": { "from_parameter": "x" }, "y": 3 }, "result": true } });
+        assert!((eval_apply_subgraph(&md, 7.0).unwrap() - 1.0).abs() < 1e-9);
+        // between(5, 0, 10) = 1.
+        let bt = json!({ "b": { "process_id": "between",
+            "arguments": { "x": { "from_parameter": "x" }, "min": 0, "max": 10 }, "result": true } });
+        assert!((eval_apply_subgraph(&bt, 5.0).unwrap() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eval_apply_subgraph_binds_nonstandard_parameter_name() {
+        // L1: a callback declaring a non-`x` parameter still binds the pixel.
+        let pg = json!({
+            "a": { "process_id": "add",
+                   "arguments": { "x": { "from_parameter": "value" }, "y": 1 }, "result": true }
+        });
+        assert!((eval_apply_subgraph(&pg, 4.0).unwrap() - 5.0).abs() < 1e-9);
     }
 
     #[test]

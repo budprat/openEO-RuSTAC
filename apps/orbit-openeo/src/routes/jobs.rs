@@ -107,6 +107,23 @@ async fn create_job(
             .into_response();
     }
 
+    // **M4 (process audit)**: reject unimplemented processes at submit time
+    // rather than letting an async job fail later with status=error. Checks
+    // every referenced process id (incl. sub-callbacks) against the
+    // implemented set.
+    let known = crate::process_catalog::process_ids();
+    let unsupported = crate::process_graph::unsupported_process_ids(&body, &known);
+    if !unsupported.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": "ProcessUnsupported",
+                "message": format!("unsupported process(es): {}", unsupported.join(", ")),
+            })),
+        )
+            .into_response();
+    }
+
     let rec = match state
         .jobs
         .create(DEFAULT_USER, title, description, process_inner)

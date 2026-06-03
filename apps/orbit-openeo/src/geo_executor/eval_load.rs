@@ -861,6 +861,18 @@ impl GeoExecutor {
                 ),
             );
             cube.insert("scene_count".into(), Value::from(scenes.len()));
+            // **H2 (process audit)**: per-scene timestamps, index-aligned with
+            // each band's path vector (scene order), so `filter_temporal` can
+            // prune scenes by time. Emitted only when EVERY scene has a
+            // datetime — a partial set would mis-align the time axis on prune.
+            if scenes.iter().all(|s| s.datetime.is_some()) {
+                let dts: Vec<Value> = scenes
+                    .iter()
+                    .filter_map(|s| s.datetime.clone())
+                    .map(Value::String)
+                    .collect();
+                cube.insert("datetimes".into(), Value::Array(dts));
+            }
             cube.insert("bands".into(), Value::Object(bands_map));
             return Ok(json!({ "__cube": Value::Object(cube) }));
         }
@@ -1073,7 +1085,7 @@ mod tests {
         use crate::geo_executor::stac::StacScene;
         let mut bands = std::collections::BTreeMap::new();
         bands.insert("red".to_string(), "https://x/red.tif".to_string());
-        let scene = StacScene { id: "s".into(), bands, band_metadata: Default::default() };
+        let scene = StacScene { id: "s".into(), bands, band_metadata: Default::default(), datetime: None };
         // Asking for canonical B04 resolves the `red` alias href.
         assert_eq!(resolve_band_href(&scene, "B04").as_deref(), Some("https://x/red.tif"));
         // Asking for a band not present (even via alias) → None.

@@ -562,6 +562,11 @@ impl ProcessGraphExecutor for GeoExecutor {
 /// we can find) with a `_orbit_meta` annotation listing every filter
 /// that has been applied so far — useful for debugging graphs without
 /// dropping the cube state.
+///
+/// **H2 (process audit)**: no longer used by `filter_temporal`/`spatial`/`bbox`
+/// (those now do real filtering). Retained as a utility for any future
+/// metadata-only passthrough process; allow(dead_code) until then.
+#[allow(dead_code)]
 pub(super) fn filter_passthrough(
     args: &std::collections::BTreeMap<String, Value>,
     arg_names: &[&str],
@@ -1391,41 +1396,40 @@ pub(super) mod tests {
         assert!(matches!(r, Err(ExecError::InvalidGraph(_))));
     }
 
+    // **H2 (process audit)**: filter_temporal / filter_spatial / filter_bbox
+    // are no longer silent metadata-only passthroughs — they do REAL
+    // filtering. The lightweight `load_collection` sentinel (id-only, no
+    // __cube / no datetimes) is not a filterable cube, so the real processes
+    // correctly REJECT it instead of silently returning unfiltered data.
+
     #[tokio::test(flavor = "current_thread")]
-    async fn filter_temporal_passes_data_and_records_metadata() {
+    async fn filter_temporal_requires_datetimes() {
         let body = graph(json!({
             "l": { "process_id": "load_collection", "arguments": { "id": "c" } },
             "f": { "process_id": "filter_temporal",
                    "arguments": { "data": { "from_node": "l" }, "extent": ["2024-01-01", "2024-06-01"] },
                    "result": true }
         }));
-        let r = GeoExecutor::new().run_sync(&body).await.unwrap();
-        let v: Value = serde_json::from_slice(&r.body).unwrap();
-        // Original cube fields preserved.
-        assert_eq!(v["type"], "DataCube");
-        assert_eq!(v["collection"], "c");
-        // Filter metadata captured.
-        let applied = &v["_orbit_meta"]["applied"];
-        assert_eq!(applied[0]["step"], "applied_filter_temporal");
-        assert!(applied[0]["extent"].is_array());
+        let r = GeoExecutor::new().run_sync(&body).await;
+        assert!(matches!(r, Err(ExecError::InvalidGraph(_))),
+            "filter_temporal must reject a cube without per-scene datetimes, got {r:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn filter_spatial_records_metadata() {
+    async fn filter_spatial_rejects_geometry_without_coordinates() {
         let body = graph(json!({
             "l": { "process_id": "load_collection", "arguments": { "id": "c" } },
             "f": { "process_id": "filter_spatial",
                    "arguments": { "data": { "from_node": "l" }, "geometries": {"type":"Polygon"} },
                    "result": true }
         }));
-        let r = GeoExecutor::new().run_sync(&body).await.unwrap();
-        let v: Value = serde_json::from_slice(&r.body).unwrap();
-        let applied = &v["_orbit_meta"]["applied"];
-        assert_eq!(applied[0]["step"], "applied_filter_spatial");
+        let r = GeoExecutor::new().run_sync(&body).await;
+        assert!(matches!(r, Err(ExecError::InvalidGraph(_))),
+            "filter_spatial must reject geometries with no derivable bbox, got {r:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn filter_bbox_records_extent() {
+    async fn filter_bbox_rejects_non_cube_input() {
         let body = graph(json!({
             "l": { "process_id": "load_collection", "arguments": { "id": "c" } },
             "f": { "process_id": "filter_bbox",
@@ -1433,9 +1437,9 @@ pub(super) mod tests {
                                   "extent": {"west": 0, "south": 0, "east": 1, "north": 1} },
                    "result": true }
         }));
-        let r = GeoExecutor::new().run_sync(&body).await.unwrap();
-        let v: Value = serde_json::from_slice(&r.body).unwrap();
-        assert_eq!(v["_orbit_meta"]["applied"][0]["step"], "applied_filter_bbox");
+        let r = GeoExecutor::new().run_sync(&body).await;
+        assert!(matches!(r, Err(ExecError::InvalidGraph(_))),
+            "filter_bbox must reject an input with no raster bands to crop, got {r:?}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1548,21 +1552,18 @@ pub(super) mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn chained_filters_accumulate_meta() {
+    async fn filter_temporal_rejects_malformed_extent() {
+        // H2: an empty `extent` array is not a valid 2-element interval —
+        // the real process rejects it instead of silently tagging metadata.
         let body = graph(json!({
             "l":  { "process_id": "load_collection", "arguments": { "id": "c" } },
             "ft": { "process_id": "filter_temporal",
-                    "arguments": { "data": { "from_node": "l" }, "extent": [] } },
-            "fs": { "process_id": "filter_spatial",
-                    "arguments": { "data": { "from_node": "ft" }, "geometries": {} },
+                    "arguments": { "data": { "from_node": "l" }, "extent": [] },
                     "result": true }
         }));
-        let r = GeoExecutor::new().run_sync(&body).await.unwrap();
-        let v: Value = serde_json::from_slice(&r.body).unwrap();
-        let applied = v["_orbit_meta"]["applied"].as_array().unwrap();
-        assert_eq!(applied.len(), 2, "both filters must accumulate");
-        assert_eq!(applied[0]["step"], "applied_filter_temporal");
-        assert_eq!(applied[1]["step"], "applied_filter_spatial");
+        let r = GeoExecutor::new().run_sync(&body).await;
+        assert!(matches!(r, Err(ExecError::InvalidGraph(_))),
+            "filter_temporal must reject a malformed extent, got {r:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

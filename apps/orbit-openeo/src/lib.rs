@@ -39,6 +39,7 @@ pub mod url_policy;
 pub mod typed_stac;
 pub mod job_registry;
 pub mod job_store;
+pub mod process_catalog;
 pub mod process_graph;
 pub mod routes;
 pub mod runner;
