@@ -20,6 +20,9 @@ pub fn router() -> Router<AppState> {
         .route("/collections", get(list_collections))
         .route("/collections/{collection_id}", get(get_collection))
         .route("/processes", get(list_processes))
+        // openEO 1.x spec endpoint. `/output_formats` is the pre-1.0 name,
+        // kept as a back-compat alias.
+        .route("/file_formats", get(list_file_formats))
         .route("/output_formats", get(list_output_formats))
         .route("/service_types", get(list_service_types))
         .route("/udf_runtimes", get(list_udf_runtimes))
@@ -51,16 +54,41 @@ async fn get_collection(
 }
 
 async fn list_processes() -> Json<Value> {
-    Json(json!({ "processes": [], "links": [] }))
+    // H1 (process audit): advertise the implemented process set. The openEO
+    // API requires `/processes` to list every supported process with its
+    // description; the previous `[]` stub made clients believe the backend
+    // supported nothing. Source of truth is `process_catalog` (kept in
+    // lock-step with the runtime registry by a geo-kernel test).
+    Json(json!({
+        "processes": crate::process_catalog::process_descriptions(),
+        "links": [],
+    }))
 }
 
-async fn list_output_formats() -> Json<Value> {
+/// The output file formats this backend can write (shared by the spec
+/// `/file_formats` endpoint and the legacy `/output_formats` alias).
+fn output_formats_map() -> Value {
+    json!({
+        "GTiff": { "title": "GeoTIFF", "gis_data_types": ["raster"], "parameters": {} },
+        "COG":   { "title": "Cloud-Optimized GeoTIFF", "gis_data_types": ["raster"], "parameters": {} },
+        "PNG":   { "title": "Portable Network Graphics", "gis_data_types": ["raster"], "parameters": {} },
+        "JSON":  { "title": "JSON", "gis_data_types": ["other"], "parameters": {} }
+    })
+}
+
+/// `GET /file_formats` — openEO 1.x file-format discovery. `input` is empty
+/// (this backend ingests data via STAC `load_collection`, not file upload);
+/// `output` lists the `save_result` formats.
+async fn list_file_formats() -> Json<Value> {
     Json(json!({
-        "output": {
-            "GTiff": { "title": "GeoTIFF", "gis_data_types": ["raster"], "parameters": {} },
-            "COG":   { "title": "Cloud-Optimized GeoTIFF", "gis_data_types": ["raster"], "parameters": {} }
-        }
+        "input": {},
+        "output": output_formats_map(),
     }))
+}
+
+/// `GET /output_formats` — pre-1.0 alias. Returns just the `output` map.
+async fn list_output_formats() -> Json<Value> {
+    Json(json!({ "output": output_formats_map() }))
 }
 
 async fn list_service_types() -> Json<Value> { Json(json!({})) }
@@ -99,6 +127,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn list_processes_advertises_implemented_set() {
+        // H1 regression: `/processes` must NOT be empty and must describe
+        // real processes (id + parameters + returns) so openEO clients can
+        // discover capabilities.
+        let resp = app()
+            .oneshot(axum::http::Request::builder().uri("/processes").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        let procs = v["processes"].as_array().expect("processes array");
+        assert!(procs.len() >= 60, "expected the full implemented set, got {}", procs.len());
+        let ids: Vec<&str> = procs.iter().filter_map(|p| p["id"].as_str()).collect();
+        assert!(ids.contains(&"ndvi"));
+        assert!(ids.contains(&"reduce_dimension"));
+        assert!(ids.contains(&"load_collection"));
+        // Each entry is spec-shaped.
+        assert!(procs[0].get("parameters").and_then(|p| p.as_array()).is_some());
+        assert!(procs[0].get("returns").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn output_formats_includes_cog_and_gtiff() {
         let resp = app()
             .oneshot(axum::http::Request::builder().uri("/output_formats").body(Body::empty()).unwrap())
@@ -107,6 +157,20 @@ mod tests {
         let v: Value = serde_json::from_slice(&bytes).unwrap();
         assert!(v["output"]["COG"].is_object());
         assert!(v["output"]["GTiff"].is_object());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn file_formats_has_input_and_output_keys() {
+        // openEO 1.x spec endpoint: `{input:{}, output:{...}}`.
+        let resp = app()
+            .oneshot(axum::http::Request::builder().uri("/file_formats").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["input"].is_object(), "file_formats must have an `input` map");
+        assert!(v["output"]["GTiff"].is_object());
+        assert!(v["output"]["PNG"].is_object());
     }
 
     // ------------------------------------------------------------------

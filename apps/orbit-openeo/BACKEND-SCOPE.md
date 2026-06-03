@@ -21,12 +21,14 @@
 
 ## 2. The Bounded Process Set
 
-The local `GeoExecutor` (`apps/orbit-openeo/src/geo_executor/`) implements an openEO 1.3.0 process subset. The **authoritative list** is `geo_executor/registry.rs::register_defaults` — **67 processes as of 2026-05-25** (up from 8 at 0.1.0). Representative cube-level nodes:
+The local `GeoExecutor` (`apps/orbit-openeo/src/geo_executor/`) implements an openEO 1.3.0 process subset. The **authoritative list** is `geo_executor/registry.rs::register_defaults` — **68 processes as of 2026-06-03** (up from 8 at 0.1.0). The non-gated mirror `src/process_catalog.rs` powers `GET /processes` + submit-time validation and is asserted equal to the registry by `registry_matches_process_catalog`. Representative cube-level nodes:
 
 | Process | openEO spec ID | Status |
 |---|---|---|
-| `load_collection` | `load_collection` | ✅ (DN→reflectance scaling from STAC `raster:bands`) |
-| `filter_temporal` / `filter_spatial` / `filter_bands` | same | ✅ |
+| `load_collection` | `load_collection` | ✅ (DN→reflectance scaling from STAC `raster:bands`; carries per-scene `datetime`) |
+| `filter_temporal` / `filter_spatial` / `filter_bbox` | same | ✅ **real filtering** (2026-06-03 — were no-op passthroughs; now prune scenes by time / re-crop by bbox/geometry) |
+| `filter_bands` | same | ✅ |
+| `aggregate_spatial` | `aggregate_spatial` | ✅ (2026-06-03 — GeoJSON polygons reprojected to raster CRS + reducer callback) |
 | `mask` / `mask_scl_dilation` | `mask` (+ convenience) | ✅ (per-band SCL resample for mixed-resolution) |
 | `reduce_dimension` | `reduce_dimension` | ✅ 10 reducers (mean/min/max/sum/median/count/first/last/sd/variance) + **arbitrary callbacks**, over `t` **and** `bands` axes |
 | `merge_cubes` | `merge_cubes` | ✅ Case 1 (band-axis join) + Case 2 (`overlap_resolver`) + Case 3 (spatial mosaic) |

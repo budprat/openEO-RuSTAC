@@ -9,11 +9,11 @@
 //! client expects).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -63,6 +63,20 @@ pub struct JobAsset {
     pub size: u64,
 }
 
+/// openEO log entry (`GET /jobs/{id}/logs`). `level` is one of
+/// `debug`/`info`/`warning`/`error`; `time` is RFC3339.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobLogEntry {
+    /// Stable per-entry id (monotonic index as a string).
+    pub id: String,
+    /// Log level: debug | info | warning | error.
+    pub level: String,
+    /// Human-readable message.
+    pub message: String,
+    /// RFC3339 timestamp.
+    pub time: String,
+}
+
 /// One persisted job. The openEO "Detailed Job" extends this — vendor
 /// extras stored under `extra` for round-trip.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -107,7 +121,7 @@ impl JobRecord {
     }
 }
 
-fn iso8601(unix_secs: u64) -> String {
+pub(crate) fn iso8601(unix_secs: u64) -> String {
     // Minimal ISO-8601 without dragging in chrono. openEO clients accept
     // "1970-01-01T00:00:00Z"-shaped strings — we emit the same.
     let secs = unix_secs as i64;
@@ -183,6 +197,15 @@ pub trait JobStore: Send + Sync {
     /// in [`crate::file_store::FileStore`]; this stores only metadata.
     async fn add_asset(&self, id: &str, asset: JobAsset) -> Result<(), JobError>;
 
+    /// Append a log entry for a job (powers `GET /jobs/{id}/logs`). The
+    /// `id`/`time` fields of the entry are assigned by the implementation;
+    /// callers pass the `level` + `message`. No-op error `NotFound` if absent.
+    async fn append_log(&self, id: &str, level: &str, message: &str) -> Result<(), JobError>;
+
+    /// Fetch a job's log entries in insertion order. Errors `NotFound` for an
+    /// absent job; returns an empty vec for a job with no logs.
+    async fn get_logs(&self, id: &str) -> Result<Vec<JobLogEntry>, JobError>;
+
     /// **Orphan recovery (2026-05-25, ported from JonaAI
     /// `jobs.py` startup recovery)**: transition every job stuck in a
     /// non-terminal state (`Queued` or `Running`) to `Error`. Called once
@@ -194,11 +217,12 @@ pub trait JobStore: Send + Sync {
     async fn recover_orphans(&self) -> Result<usize, JobError>;
 }
 
-/// In-memory store backed by a `Mutex<Vec<JobRecord>>` and an atomic counter.
+/// In-memory store backed by a `Mutex<Vec<JobRecord>>`. Job ids are v4 UUIDs.
 #[derive(Debug, Default)]
 pub struct InMemoryJobStore {
     inner: Mutex<Vec<JobRecord>>,
-    counter: AtomicU64,
+    /// Per-job log entries (job id → entries in insertion order).
+    logs: Mutex<std::collections::HashMap<String, Vec<JobLogEntry>>>,
 }
 
 impl InMemoryJobStore {
@@ -223,11 +247,13 @@ impl JobStore for InMemoryJobStore {
         description: Option<String>,
         process: Value,
     ) -> Result<JobRecord, JobError> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        // Deterministic-but-unique-per-call id. We deliberately don't
-        // expose epoch seconds in the id so two jobs created in the same
-        // second don't collide.
-        let id = format!("job-{n:08x}");
+        // Job ids are RFC-4122 v4 UUIDs: globally unique, opaque, and
+        // collision-free without a shared counter (so concurrent creators and
+        // process restarts never clash). Surfaced verbatim in the
+        // `openeo-identifier` header / `Location` and used as the result-asset
+        // directory name (UUIDs are filesystem-path-safe — see
+        // file_store::validate_path).
+        let id = Uuid::new_v4().to_string();
         let now = Self::now();
         let rec = JobRecord {
             id: id.clone(),
@@ -305,6 +331,7 @@ impl JobStore for InMemoryJobStore {
     async fn delete(&self, id: &str) -> Result<(), JobError> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.retain(|r| r.id != id);
+        self.logs.lock().unwrap_or_else(|p| p.into_inner()).remove(id);
         Ok(())
     }
 
@@ -317,6 +344,42 @@ impl JobStore for InMemoryJobStore {
         rec.assets.push(asset);
         rec.updated = Self::now();
         Ok(())
+    }
+
+    async fn append_log(&self, id: &str, level: &str, message: &str) -> Result<(), JobError> {
+        // Require the job to exist.
+        {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if !g.iter().any(|r| r.id == id) {
+                return Err(JobError::NotFound(id.into()));
+            }
+        }
+        let mut logs = self.logs.lock().unwrap_or_else(|p| p.into_inner());
+        let entries = logs.entry(id.to_string()).or_default();
+        let entry = JobLogEntry {
+            id: entries.len().to_string(),
+            level: level.to_string(),
+            message: message.to_string(),
+            time: iso8601(Self::now()),
+        };
+        entries.push(entry);
+        Ok(())
+    }
+
+    async fn get_logs(&self, id: &str) -> Result<Vec<JobLogEntry>, JobError> {
+        {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if !g.iter().any(|r| r.id == id) {
+                return Err(JobError::NotFound(id.into()));
+            }
+        }
+        Ok(self
+            .logs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn recover_orphans(&self) -> Result<usize, JobError> {
@@ -345,7 +408,6 @@ impl JobStore for InMemoryJobStore {
 /// | status     | progress | created | updated | assets JSON
 pub struct SqliteJobStore {
     pool: sqlx::SqlitePool,
-    counter: AtomicU64,
 }
 
 impl std::fmt::Debug for SqliteJobStore {
@@ -387,27 +449,32 @@ impl SqliteJobStore {
                 progress    REAL,
                 created     INTEGER NOT NULL,
                 updated     INTEGER NOT NULL,
-                assets      TEXT NOT NULL DEFAULT '[]'
+                assets      TEXT NOT NULL DEFAULT '[]',
+                logs        TEXT NOT NULL DEFAULT '[]'
             )"#,
         )
         .execute(&pool)
         .await
         .map_err(|e| JobError::Backend(format!("migrate: {e}")))?;
+        // Idempotent migration for DBs created before the `logs` column
+        // existed. SQLite errors if the column is already present — ignore
+        // exactly that case so reopening a current DB is a no-op.
+        if let Err(e) = sqlx::query("ALTER TABLE jobs ADD COLUMN logs TEXT NOT NULL DEFAULT '[]'")
+            .execute(&pool)
+            .await
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(JobError::Backend(format!("migrate logs column: {msg}")));
+            }
+        }
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
             .execute(&pool)
             .await
             .map_err(|e| JobError::Backend(format!("index: {e}")))?;
-        // Seed counter from max id suffix so restarts don't collide.
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM jobs ORDER BY created DESC LIMIT 1")
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| JobError::Backend(format!("seed: {e}")))?;
-        let start = row
-            .and_then(|(id,)| u64::from_str_radix(id.trim_start_matches("job-"), 16).ok())
-            .map(|n| n + 1)
-            .unwrap_or(0);
-        Ok(Self { pool, counter: AtomicU64::new(start) })
+        // Job ids are v4 UUIDs (globally unique) so there's no counter to
+        // seed from existing rows on restart — UUIDs never collide.
+        Ok(Self { pool })
     }
 
     fn now() -> u64 {
@@ -453,8 +520,7 @@ impl JobStore for SqliteJobStore {
         description: Option<String>,
         process: Value,
     ) -> Result<JobRecord, JobError> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let id = format!("job-{n:08x}");
+        let id = Uuid::new_v4().to_string();
         let now = Self::now() as i64;
         let process_json = serde_json::to_string(&process)
             .map_err(|e| JobError::Backend(format!("encode process: {e}")))?;
@@ -611,6 +677,47 @@ impl JobStore for SqliteJobStore {
         Ok(())
     }
 
+    async fn append_log(&self, id: &str, level: &str, message: &str) -> Result<(), JobError> {
+        // Transactional read-modify-write, mirroring add_asset.
+        let mut tx = self.pool.begin().await
+            .map_err(|e| JobError::Backend(format!("tx: {e}")))?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT logs FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| JobError::Backend(format!("select logs: {e}")))?;
+        let (logs_json,) = row.ok_or_else(|| JobError::NotFound(id.into()))?;
+        let mut logs: Vec<JobLogEntry> = serde_json::from_str(&logs_json)
+            .map_err(|e| JobError::Backend(format!("decode logs: {e}")))?;
+        logs.push(JobLogEntry {
+            id: logs.len().to_string(),
+            level: level.to_string(),
+            message: message.to_string(),
+            time: iso8601(Self::now()),
+        });
+        let logs_json = serde_json::to_string(&logs)
+            .map_err(|e| JobError::Backend(format!("encode logs: {e}")))?;
+        sqlx::query("UPDATE jobs SET logs = ? WHERE id = ?")
+            .bind(&logs_json)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| JobError::Backend(format!("update logs: {e}")))?;
+        tx.commit().await.map_err(|e| JobError::Backend(format!("commit: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_logs(&self, id: &str) -> Result<Vec<JobLogEntry>, JobError> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT logs FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| JobError::Backend(format!("select logs: {e}")))?;
+        let (logs_json,) = row.ok_or_else(|| JobError::NotFound(id.into()))?;
+        serde_json::from_str(&logs_json)
+            .map_err(|e| JobError::Backend(format!("decode logs: {e}")))
+    }
+
     async fn recover_orphans(&self) -> Result<usize, JobError> {
         // Single UPDATE: flip queued/running → error. Matches JonaAI's
         // startup raw-SQL recovery (jobs.py:93).
@@ -645,7 +752,9 @@ mod tests {
         let a = s.create("alice", None, None, graph()).await.unwrap();
         let b = s.create("alice", None, None, graph()).await.unwrap();
         assert_ne!(a.id, b.id);
-        assert!(a.id.starts_with("job-"));
+        // Job ids are v4 UUIDs.
+        assert!(Uuid::parse_str(&a.id).is_ok(), "job id must be a UUID, got {}", a.id);
+        assert_eq!(Uuid::parse_str(&a.id).unwrap().get_version_num(), 4);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -943,7 +1052,8 @@ mod tests {
         let got = s2.get(&saved_id).await.unwrap();
         assert_eq!(got.title.as_deref(), Some("persist"));
         assert_eq!(got.status, JobStatus::Finished);
-        // Counter should resume past the persisted id.
+        // A freshly-created job gets a new v4 UUID, distinct from the
+        // persisted one (UUIDs never collide across restarts).
         let next = s2.create("alice", None, None, graph()).await.unwrap();
         assert_ne!(next.id, saved_id);
         let _ = std::fs::remove_dir_all(&dir);

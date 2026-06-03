@@ -182,15 +182,21 @@ fn validate_reduce_subgraph_processes(
             ExecError::InvalidGraph(format!("reduce_dimension.reducer: node `{id}` has no process_id"))
         })?;
         let is_array_reducer = Reducer::from_process_id(pid).is_some();
+        // M1 (process audit): keep this set in parity with the apply kernel
+        // and the top-level registry so the same pure-numeric processes work
+        // wherever a callback runs.
         let is_scalar_op = matches!(
             pid,
             "add" | "subtract" | "multiply" | "divide" | "power" | "absolute"
                 | "clip" | "min" | "max" | "sqrt" | "exp" | "ln"
+                | "mod" | "sgn" | "sign" | "floor" | "ceil" | "int" | "round"
+                | "normalized_difference" | "between"
+                | "cos" | "sin" | "tan" | "arccos" | "arcsin" | "arctan" | "arctan2"
         );
         if !is_array_reducer && !is_scalar_op {
             return Err(ExecError::InvalidGraph(format!(
                 "reduce_dimension.reducer: unsupported process `{pid}` in reducer callback \
-                 (supported: statistical reducers + add/subtract/multiply/divide/power/absolute/clip/min/max/sqrt/exp/ln)"
+                 (supported: statistical reducers + arithmetic/trig/rounding/comparison scalar ops)"
             )));
         }
     }
@@ -323,6 +329,54 @@ fn eval_reduce_node(
                 let lo = scalar(resolve("min", memo, in_progress)?, "min")?;
                 let hi = scalar(resolve("max", memo, in_progress)?, "max")?;
                 RedVal::Scalar(x.clamp(lo, hi))
+            }
+            // M1 (process audit): parity with the apply kernel / registry.
+            "mod" => {
+                let x = scalar(resolve("x", memo, in_progress)?, "x")?;
+                let y = scalar(resolve("y", memo, in_progress)?, "y")?;
+                RedVal::Scalar(x - y * (x / y).floor())
+            }
+            "sgn" | "sign" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.signum()),
+            "floor" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.floor()),
+            "ceil" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.ceil()),
+            "int" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.trunc()),
+            "round" => {
+                let x = scalar(resolve("x", memo, in_progress)?, "x")?;
+                // `p` is optional (default 0) — read directly so a missing
+                // arg isn't an error.
+                let p = args
+                    .and_then(|m| m.get("p"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let factor = 10f32.powi(p as i32);
+                RedVal::Scalar((x * factor).round_ties_even() / factor)
+            }
+            "normalized_difference" => {
+                let x = scalar(resolve("x", memo, in_progress)?, "x")?;
+                let y = scalar(resolve("y", memo, in_progress)?, "y")?;
+                if x + y == 0.0 {
+                    return Err(ExecError::PerPixelComputation(
+                        "reduce_dimension.reducer: normalized_difference x + y == 0".into(),
+                    ));
+                }
+                RedVal::Scalar((x - y) / (x + y))
+            }
+            "between" => {
+                let x = scalar(resolve("x", memo, in_progress)?, "x")?;
+                let lo = scalar(resolve("min", memo, in_progress)?, "min")?;
+                let hi = scalar(resolve("max", memo, in_progress)?, "max")?;
+                RedVal::Scalar(if x >= lo && x <= hi { 1.0 } else { 0.0 })
+            }
+            "cos" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.cos()),
+            "sin" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.sin()),
+            "tan" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.tan()),
+            "arccos" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.acos()),
+            "arcsin" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.asin()),
+            "arctan" => RedVal::Scalar(scalar(resolve("x", memo, in_progress)?, "x")?.atan()),
+            "arctan2" => {
+                let y = scalar(resolve("y", memo, in_progress)?, "y")?;
+                let x = scalar(resolve("x", memo, in_progress)?, "x")?;
+                RedVal::Scalar(y.atan2(x))
             }
             other => return Err(ExecError::InvalidGraph(format!(
                 "reduce_dimension.reducer: unsupported process `{other}`"

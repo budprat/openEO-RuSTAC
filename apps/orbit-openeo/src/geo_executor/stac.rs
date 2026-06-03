@@ -54,6 +54,11 @@ pub struct StacScene {
     /// downstream P3 path must fall back to `Dataset::open` probing.
     #[serde(default)]
     pub band_metadata: BTreeMap<String, BandMetadata>,
+    /// Scene acquisition timestamp from STAC `properties.datetime` (RFC3339).
+    /// `None` when the item omitted it. Carried onto the `__cube` so
+    /// `filter_temporal` can prune scenes by time (H2, process audit).
+    #[serde(default)]
+    pub datetime: Option<String>,
 }
 
 /// Owned collection of STAC scenes returned by a search. Implements
@@ -281,11 +286,16 @@ impl StacSearcher for HttpStacSearcher {
             // hit either keying.
             let bands = collect_band_hrefs(&assets);
             let band_metadata = collect_band_metadata(&assets, item_epsg);
+            let datetime = f
+                .get("properties")
+                .and_then(|p| p.get("datetime"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             if bands.is_empty() {
                 tracing::warn!(item = %id, "skipping scene with no asset hrefs");
                 continue;
             }
-            scenes.push(StacScene { id, bands, band_metadata });
+            scenes.push(StacScene { id, bands, band_metadata, datetime });
         }
         Ok(scenes)
     }
@@ -699,6 +709,7 @@ mod tests {
             id: "s0".into(),
             bands: BTreeMap::new(),
             band_metadata: BTreeMap::new(),
+            datetime: None,
         };
         s0.bands.insert("B04".into(), "/tmp/s0_red.tif".into());
         s0.bands.insert("B08".into(), "/tmp/s0_nir.tif".into());
@@ -706,6 +717,7 @@ mod tests {
             id: "s1".into(),
             bands: BTreeMap::new(),
             band_metadata: BTreeMap::new(),
+            datetime: None,
         };
         s1.bands.insert("B04".into(), "/tmp/s1_red.tif".into());
         s1.bands.insert("B08".into(), "/tmp/s1_nir.tif".into());
@@ -724,6 +736,7 @@ mod tests {
             id: "s0".into(),
             bands: BTreeMap::new(),
             band_metadata: BTreeMap::new(),
+            datetime: None,
         };
         s0.bands.insert("B04".into(), "/tmp/s0_red.tif".into());
         // s1 has no B04 — should be silently dropped.
@@ -731,11 +744,13 @@ mod tests {
             id: "s1".into(),
             bands: BTreeMap::new(),
             band_metadata: BTreeMap::new(),
+            datetime: None,
         };
         let mut s2 = StacScene {
             id: "s2".into(),
             bands: BTreeMap::new(),
             band_metadata: BTreeMap::new(),
+            datetime: None,
         };
         s2.bands.insert("B04".into(), "/tmp/s2_red.tif".into());
         let fc = FeatureCollection::new(vec![s0, s1, s2]);

@@ -64,6 +64,14 @@ pub struct DataCube {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene_count: Option<u64>,
 
+    /// Per-scene acquisition timestamps (RFC3339), index-aligned with each
+    /// band's path vector. Populated by `load_collection` from STAC
+    /// `properties.datetime`. Consumed by `filter_temporal` to prune scenes
+    /// by time (H2, process audit). Optional — absent when the STAC backend
+    /// omitted datetimes (then `filter_temporal` errors rather than guessing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datetimes: Option<Vec<String>>,
+
     /// Time-axis size after a reduce/transform (separate from `scene_count`
     /// because reducers collapse the t axis to 1). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]

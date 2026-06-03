@@ -566,47 +566,18 @@ impl ProcessHandler for DivideHandler {
     }
 }
 
-// Filter-passthrough processes — annotate `_orbit_meta.applied` and forward
-// `data`. Names map 1:1 to the old match arms.
-pub struct FilterTemporalHandler;
-#[async_trait]
-impl ProcessHandler for FilterTemporalHandler {
-    async fn handle(
-        &self,
-        _exe: &GeoExecutor,
-        args: BTreeMap<String, Value>,
-    ) -> Result<Value, ExecError> {
-        super::filter_passthrough(&args, &["extent"], "applied_filter_temporal")
-    }
-}
+// **H2 (process audit)**: `filter_temporal` / `filter_bbox` / `filter_spatial`
+// now perform REAL filtering (was a silent metadata-only passthrough that
+// returned unfiltered data). `filter_temporal` prunes scenes by datetime
+// (sync, no GDAL); `filter_bbox` / `filter_spatial` re-crop each band-scene
+// raster (async — blocking GDAL via spawn_blocking).
+sync_handler!(FilterTemporalHandler, eval_filter_temporal);
+async_handler!(FilterBboxHandler, eval_filter_bbox);
+async_handler!(FilterSpatialHandler, eval_filter_spatial);
 
-pub struct FilterSpatialHandler;
-#[async_trait]
-impl ProcessHandler for FilterSpatialHandler {
-    async fn handle(
-        &self,
-        _exe: &GeoExecutor,
-        args: BTreeMap<String, Value>,
-    ) -> Result<Value, ExecError> {
-        super::filter_passthrough(&args, &["extent", "geometries"], "applied_filter_spatial")
-    }
-}
-
-pub struct FilterBboxHandler;
-#[async_trait]
-impl ProcessHandler for FilterBboxHandler {
-    async fn handle(
-        &self,
-        _exe: &GeoExecutor,
-        args: BTreeMap<String, Value>,
-    ) -> Result<Value, ExecError> {
-        super::filter_passthrough(
-            &args,
-            &["extent", "west", "south", "east", "north"],
-            "applied_filter_bbox",
-        )
-    }
-}
+// Standard openEO `aggregate_spatial(data, geometries, reducer)` (M3).
+// Sync — GDAL reads happen inline like the other aggregate_spatial_* arms.
+sync_handler!(AggregateSpatialHandler, eval_aggregate_spatial);
 
 /// Wire every default openEO process into `registry`. Mirrors the
 /// pre-A2 match arm one-to-one — adding a process here is the ONLY
@@ -634,6 +605,7 @@ pub fn register_defaults(registry: &mut ProcessRegistry) {
         Arc::new(AggregateSpatialPointHandler),
     );
     registry.register("merge_cubes", Arc::new(MergeCubesHandler));
+    registry.register("aggregate_spatial", Arc::new(AggregateSpatialHandler));
     registry.register("fit_classifier", Arc::new(FitClassifierHandler));
     registry.register("predict_classifier", Arc::new(PredictClassifierHandler));
 
@@ -832,6 +804,29 @@ mod tests {
         r.register("alpha", Arc::new(StubHandler { reply: Value::Null }));
         r.register("mango", Arc::new(StubHandler { reply: Value::Null }));
         assert_eq!(r.registered_processes(), vec!["alpha", "mango", "zebra"]);
+    }
+
+    #[test]
+    fn registry_matches_process_catalog() {
+        // **H1/M4 anti-drift (process audit)**: the runtime registry (what we
+        // can actually execute) MUST equal `process_catalog` (what `/processes`
+        // advertises and what `/validation` + `/jobs` accept). If they diverge,
+        // clients either can't discover an implemented process or get rejected
+        // for a process we actually run. Adding a handler now requires adding a
+        // catalog entry (and vice-versa) or this test fails.
+        let mut r = ProcessRegistry::new();
+        register_defaults(&mut r);
+        let registered: std::collections::BTreeSet<&str> =
+            r.registered_processes().into_iter().collect();
+        let catalog: std::collections::BTreeSet<&str> =
+            crate::process_catalog::process_ids().into_iter().collect();
+        let only_registered: Vec<&&str> = registered.difference(&catalog).collect();
+        let only_catalog: Vec<&&str> = catalog.difference(&registered).collect();
+        assert!(
+            only_registered.is_empty() && only_catalog.is_empty(),
+            "registry/catalog drift — registered-but-undocumented: {only_registered:?}; \
+             documented-but-unregistered: {only_catalog:?}"
+        );
     }
 
     #[test]
