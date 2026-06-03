@@ -8,7 +8,7 @@
 The public API surface of `orbit-geo` (and, going forward, the `eo-*`
 crates) intentionally mirrors the shape of the JRSRP EORS Workspace
 (`eorst` and `rss_core`, LGPL-3.0) so users can swap engines. The
-implementation is clean-room — see `docs/clean-room-protocol.md`.
+implementation is clean-room — (capabilities identified from the public API shape, then reimplemented independently; no EORS source copied).
 
 We credit EORS as the design inspiration; no code from EORS is included
 in this project.

@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 ## [Unreleased]
 
 ### Added
-- **openEO process set 8 → 69** (strictly per the 1.3.0 spec): 31 scalar math/logic ops, 9 array processes, cube-metadata ops (`filter_bands`/`rename_labels`/`add_dimension`/`drop_dimension`), `merge_cubes` (band-axis join + `overlap_resolver`), arbitrary `reduce_dimension` callbacks + a `bands` axis. Authoritative list: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`.
+- **openEO process set 8 → 67** (strictly per the 1.3.0 spec): 31 scalar math/logic ops, 9 array processes, cube-metadata ops (`filter_bands`/`rename_labels`/`add_dimension`/`drop_dimension`), `merge_cubes` (band-axis join + `overlap_resolver`), arbitrary `reduce_dimension` callbacks + a `bands` axis. Authoritative list: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`.
 - **P2-full download path is now the default**: async-tiff + `object_store` streaming + STAC `band_metadata` hint, shared S3 connection pool, cross-CRS reprojection via `proj`. Opt out to in-process GDAL with `ORBIT_INPROCESS_DOWNLOADER=1`.
 - DN→reflectance scaling from STAC `raster:bands.scale`/`offset`.
 - Job lifecycle: orphan recovery on startup + `ORBIT_JOB_TIMEOUT_SECS`.

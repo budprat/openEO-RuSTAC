@@ -45,7 +45,7 @@ carries an ETL foundation (`orbit-etl` + CLI/gRPC server) — see [Monorepo layo
 | | |
 |---|---|
 | **openEO 1.3.0 REST API** | Axum server; every request JSON-Schema-validated against the shipped `spec/openapi.json`. |
-| **~69 openEO processes** | Reducers + arbitrary callbacks, `merge_cubes` (band-join + overlap-resolve), per-pixel `apply`, 31 scalar math/logic + 9 array processes, cube-metadata ops. Authoritative list: `geo_executor/registry.rs::register_defaults`. |
+| **67 openEO processes** | Reducers + arbitrary callbacks, `merge_cubes` (band-join + overlap-resolve), per-pixel `apply`, 31 scalar math/logic + 9 array processes, cube-metadata ops. Authoritative list: `geo_executor/registry.rs::register_defaults`. |
 | **P2-full streaming download (default)** | Pure-Rust [`async-tiff`](https://crates.io/crates/async-tiff) + [`object_store`](https://crates.io/crates/object_store) COG reads with a STAC `band_metadata` hint and a shared S3 connection pool — **no libGDAL on the hot read path**. |
 | **Cross-CRS, no GDAL fallback** | bbox reprojection via pure-Rust [`proj`](https://crates.io/crates/proj). |
 | **Block-parallel compute** | `RasterDataset<f32>` tiled, multi-threaded reduction kernels. |
@@ -203,7 +203,7 @@ Confirm the active path in the logs: `downloader: async-tiff + object_store + ST
 
 ## 🧩 Supported processes
 
-**~69 processes** as of 2026-05-25 (authoritative: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`):
+**67 processes** as of 2026-05-25 (authoritative: `apps/orbit-openeo/src/geo_executor/registry.rs::register_defaults`):
 
 | Category | Processes |
 |---|---|
@@ -256,7 +256,7 @@ In [`apps/orbit-openeo/examples/`](apps/orbit-openeo/examples) (all hit live Sen
 ## 🧪 Testing
 
 ```bash
-# full lib suite for the backend (507 tests)
+# full lib suite for the backend (515 tests)
 cargo test -p orbit-openeo --features geo-kernel,async-tiff-downloader --lib
 
 # whole workspace
@@ -278,6 +278,25 @@ phase timing — per-node-category wall (download=load_collection, mask=mask_scl
 
 On a typical Sentinel-2 graph this shows **~89 % download / ~5 % compute** — wall time is S3-I/O-bound,
 not CPU-bound. STAC-hint telemetry (`hint_dispatched=N hint_missing=0`) confirms the P2 fast path is live.
+
+---
+
+## 🐳 Docker deployment
+
+The multi-stage [`Dockerfile`](Dockerfile) builds and ships the **`orbit-openeo`** server
+(GDAL-backed, default `geo-kernel` feature) on a slim Debian runtime:
+
+```bash
+docker build -t orbit-openeo:latest .
+docker run --rm -p 9080:9080 orbit-openeo:latest \
+  --bind 0.0.0.0:9080 --executor geo --auth-token "$TOKEN" \
+  --stac-url https://earth-search.aws.element84.com/v1
+```
+
+A non-loopback `--bind` (`0.0.0.0`) **requires** `--auth-token`, or the server refuses to start
+(security default). The image ships the stable P1 (libgdal) download path; for the faster
+P2-full streaming path, add `--features async-tiff-downloader` to the builder stage and
+`libproj-dev` to its apt list.
 
 ---
 

@@ -16,7 +16,8 @@
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
 
-        # Pinned Rust toolchain — matches workspace rust-version in Cargo.toml.
+        # Pinned dev toolchain (intentionally newer than the 1.88 MSRV in
+        # Cargo.toml; this is the dev shell, not the MSRV floor).
         rust-toolchain = pkgs.rust-bin.stable."1.95.0".default.override {
           extensions = [ "rust-src" "rust-analyzer" "clippy" "rustfmt" ];
         };

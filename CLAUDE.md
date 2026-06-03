@@ -50,15 +50,15 @@ cargo build -p orbit-openeo --features geo-kernel
 
 ```bash
 cargo test -p orbit-geo --lib                                    # 134 tests
-cargo test -p orbit-openeo --features geo-kernel --lib           # 468 tests (hermetic; no synthetic-S2 fixtures)
+cargo test -p orbit-openeo --features geo-kernel --lib           # 515 tests (hermetic; no synthetic-S2 fixtures)
 cargo test -p orbit-openeo --features geo-kernel --test ndvi_mean_time_e2e             # 3 integration tests
 cargo test -p orbit-openeo --features geo-kernel --test complex_pipeline_verification  # 4 integration tests
 cargo test -p orbit-openeo --features geo-kernel --test mask_from_values_e2e           # 3 integration tests
 cargo test -p orbit-openeo --features geo-kernel --test apply_callback_e2e             # 3 integration tests
 ```
 
-Aggregate: **~615 tests, 0 failed** across orbit-geo lib (134) + orbit-openeo
-lib (468) + 4 integration test files (13). If `orbit-geo` shows 0 passed too,
+Aggregate: **~662 tests, 0 failed** across orbit-geo lib (134) + orbit-openeo
+lib (515) + 4 integration test files (13). If `orbit-geo` shows 0 passed too,
 re-run with `--lib` explicitly — `cargo test -p orbit-geo` alone runs the
 default harness which can be empty for the bin target.
 
@@ -171,8 +171,8 @@ The geo executor has **three** download paths. P2 is now the **runtime default**
 when the `async-tiff-downloader` feature is built; P1 is the diagnostic
 fallback. Pick the right one based on the table at the bottom.
 
-> Full matrix in `docs/perf/FEATURE_FLAG_MATRIX.md`.
-> Performance progression: `docs/perf/P2_P3_OPTIMIZATION_PROGRESS.md`.
+> Full matrix in `docs/perf/FEATURE_FLAG_MATRIX.md` (local-only).
+> Performance progression: `docs/perf/P2_P3_OPTIMIZATION_PROGRESS.md` (local-only).
 
 #### P1 — in-process libgdal eager download (stable fallback)
 
@@ -525,6 +525,10 @@ job fails with `backend: CollectionNotFound`.
 
 ---
 
+**Docker**: the repo `Dockerfile` builds and ships `orbit-openeo` (the openEO server) on a Debian-slim runtime — see the README "Docker deployment" section. A non-loopback `--bind` (0.0.0.0) requires `--auth-token`.
+
+---
+
 ## 4. Audited foot-guns (don't re-introduce)
 
 The codebase has cleared an 8-agent security/correctness audit. The
@@ -547,8 +551,8 @@ following invariants are load-bearing:
 | **A9** | `geo_executor/stac.rs`, all `eval_*` | `StacScene.bands: BTreeMap<String, String>` and `__cube.bands: {<name>: [paths]}` — never reintroduce `red_href`/`nir_href`/`scl_href`/`red_paths`/`nir_paths`/`scl_paths`/`ndvi_paths` flat keys. `ndvi(nir, red, target_band)` args MUST be honored, not hardcoded. |
 | **A12** | `crates/orbit-geo/src/providers.rs::build_gdal_translate_argv` | `-projwin_srs <crs>` is mandatory whenever the bbox is in a CRS different from the COG's native (default openEO EPSG:4326 vs S2 UTM). Without it, degree-scale bboxes collapse to 1×1 output. |
 | **UTM-1px** | `geo_executor/eval_mask.rs` two workers | Data + mask cubes can differ by ±1 px after UTM reprojection. Iterate using `min(rdb.dims, mblock.dims)` — never `rdb.dims` blindly. |
-| **SCL-20m** | `geo_executor/eval_mask.rs::resample_scl_to_data_grid` | S2 SCL is published at 20 m; B04/B08 are 10 m. `mask_scl_dilation` MUST auto-resample SCL to data resolution via `gdalwarp -r near` (nearest-neighbour — SCL is categorical) before applying. Without this the inner kernel rejects with `inconsistent metadata: data has N blocks, mask has M`. **GAP (BUG-001, 2026-05-24)**: this auto-resample only fires on the FIRST band's grid; if the load mixes 10 m (B04/B08) AND 20 m (B11/B12) bands, the 20 m data still misaligns with the now-10 m mask. See `docs/perf/KNOWN_BUGS.md#BUG-001`. |
-| **multi-band cube ops** | `geo_executor/eval_apply.rs`, `eval_reduce.rs` (`bands` dim) | After `merge_cubes` joins two cubes with arbitrary `target_band` names, downstream `apply` and `reduce_dimension(dimension="bands")` reject the cube with `__cube.bands has no usable band` / `has no recognised index band (expected ndvi/ndmi/ndwi/etc.)`. Workaround: use only recognised index names (`ndvi`/`ndmi`/`ndwi`) AND apply BEFORE merge. See `docs/perf/KNOWN_BUGS.md#BUG-002` and `#BUG-003`. **(All FIXED 2026-05-25 — apply iterates all bands; reduce(bands) implemented; merge_cubes does band-axis join.)** |
+| **SCL-20m** | `geo_executor/eval_mask.rs::resample_scl_to_data_grid` | S2 SCL is published at 20 m; B04/B08 are 10 m. `mask_scl_dilation` MUST auto-resample SCL to data resolution via `gdalwarp -r near` (nearest-neighbour — SCL is categorical) before applying. Without this the inner kernel rejects with `inconsistent metadata: data has N blocks, mask has M`. **GAP (BUG-001, 2026-05-24)**: this auto-resample only fires on the FIRST band's grid; if the load mixes 10 m (B04/B08) AND 20 m (B11/B12) bands, the 20 m data still misaligns with the now-10 m mask. See `docs/perf/KNOWN_BUGS.md#BUG-001` (local-only). |
+| **multi-band cube ops** | `geo_executor/eval_apply.rs`, `eval_reduce.rs` (`bands` dim) | After `merge_cubes` joins two cubes with arbitrary `target_band` names, downstream `apply` and `reduce_dimension(dimension="bands")` reject the cube with `__cube.bands has no usable band` / `has no recognised index band (expected ndvi/ndmi/ndwi/etc.)`. Workaround: use only recognised index names (`ndvi`/`ndmi`/`ndwi`) AND apply BEFORE merge. See `docs/perf/KNOWN_BUGS.md#BUG-002` and `#BUG-003` (local-only). **(All FIXED 2026-05-25 — apply iterates all bands; reduce(bands) implemented; merge_cubes does band-axis join.)** |
 | **reflectance scaling** | `data_cube.rs::band_scales`, `eval_load.rs`, `eval_apply.rs` | **Option B (2026-05-25)**: S2 COGs store Int16 DN; openEO load_collection should return reflectance. `load_collection` harvests `raster:bands.scale`/`offset` into `cube.band_scales` (per-band). `apply` converts `v*scale+offset` BEFORE the user's sub-graph so absolute math sees reflectance. **`ndvi` is scale-invariant (ratio cancels) and deliberately does NOT scale.** SCL/QA and derived-index bands have no scale entry (identity). Output bands are physical units → `band_scales` cleared on apply output. If a future workflow does absolute math on a raw band WITHOUT going through `apply`, it would see DN — only `apply` honors the scale today. |
 
 ---
@@ -654,14 +658,19 @@ mvp/orbit-etl/
 
 **Finding (verified 2026-05-25): the repo has TWO STAC implementations.**
 
-1. **rustac-based, already vendored but dormant** — `crates/orbit-geo/Cargo.toml:26`
+1. **rustac-based, compiled in via `geo-kernel` but unused at runtime** — `crates/orbit-geo/Cargo.toml:26`
    declares a `stac` feature pulling `stac` 0.17 + `stac-api` 0.8 + `stac-io` +
    `stac-extensions` + `stac-client` + `stac-validate`. Implemented in
    `crates/orbit-geo/src/stac.rs` (`StacClient` wrapping `stac_client::Client` —
    `collections()` / `search()` + `stac_validate::Validator`) and
    `crates/orbit-geo/src/stac_helpers.rs` (7 helpers over `Vec<stac::Item>`).
-   **But** `orbit-geo` has `default = []` and the openEO app enables it with only
-   `["cloud_mask","use_ml"]` (NOT `stac`) — so this client is compiled out and unused.
+   **Correction (audit 2026-06-03)**: the openEO app's `geo-kernel` feature DOES
+   enable `orbit-geo/stac` (`apps/orbit-openeo/Cargo.toml:16` — base `orbit-geo`
+   features `["cloud_mask","use_ml"]` PLUS `orbit-geo/stac`), so `StacClient` + the
+   rustac crates **compile in by default**. But the runtime search path still uses
+   the hand-rolled `HttpStacSearcher` (below), so `StacClient` AND the
+   `apps/orbit-openeo/src/typed_stac.rs` wrapper (which uses `orbit_geo::stac::Item`)
+   are **compiled but never called** — dead at runtime, not compiled out.
 2. **Hand-rolled, what actually runs** — `apps/orbit-openeo/src/geo_executor/stac.rs`
    `HttpStacSearcher` (`reqwest` + `serde_json::Value`) extracts exactly
    `proj:epsg/transform/shape` + `raster:bands.scale/offset/nodata` into a lean
@@ -671,9 +680,10 @@ mvp/orbit-etl/
 - **Gain**: kills the duplicate STAC impl; adds `stac-validate`; typed
   `stac-extensions` parsing (Projection + Raster ext structs instead of
   `serde_json::Value` digging); pagination / conformance handling.
-- **Cost**: enable orbit-geo's `stac` feature + write an adapter
-  `stac_client::ItemCollection → StacScene/BandMetadata`; re-verify the P2 hint
-  path still gets `proj:epsg` / `raster:bands.scale`.
+- **Cost**: write an adapter `stac_client::ItemCollection → StacScene/BandMetadata`
+  (the `stac` feature is already on via geo-kernel) + delete the dead
+  `typed_stac.rs` wrapper; re-verify the P2 hint path still gets `proj:epsg` /
+  `raster:bands.scale`.
 - **Risk**: extra dep weight + the async-client model in the request path; the
   current hand-rolled extractor is leaner for the narrow hint use-case.
 
