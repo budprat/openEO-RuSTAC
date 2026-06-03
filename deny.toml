@@ -1,6 +1,6 @@
 # cargo-deny configuration for orbit-rs.
 #
-# Policy goals (per docs/clean-room-protocol.md):
+# Policy goals (clean-room dependency discipline; attribution in NOTICE.md):
 #   - Direct dependencies must be permissively licensed (MIT, Apache-2.0,
 #     BSD, ISC, Unicode-DFS-2016, Zlib).
 #   - No LGPL/GPL/AGPL anywhere — we are MIT/Apache, not derivative of

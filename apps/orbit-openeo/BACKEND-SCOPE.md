@@ -2,7 +2,7 @@
 
 > **Status**: Active. Created 2026-05-22.
 > **Audience**: Contributors adding routes, process nodes, auth paths, or any HTTP-facing behaviour to `apps/orbit-openeo`.
-> **Authority**: [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../13-geo-satellite/04-openeo-strategic-analysis.md) §4.5 (Approach D — client adapter + reference backend). This file is the operational instance of §4.5.3.
+> **Authority**: [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../../13-geo-satellite/04-openeo-strategic-analysis.md) §4.5 (Approach D — client adapter + reference backend). This file is the operational instance of §4.5.3.
 
 **Read this before opening a PR.** Any PR violating the WILL NOT list below requires a separate change to `04-openeo-strategic-analysis.md` § 4.5.3 *first*, with explicit re-opening of the Approach-D decision.
 
@@ -21,7 +21,7 @@
 
 ## 2. The Bounded Process Set
 
-The local `GeoExecutor` (`apps/orbit-openeo/src/geo_executor/`) implements an openEO 1.3.0 process subset. The **authoritative list** is `geo_executor/registry.rs::register_defaults` — **69 processes as of 2026-05-25** (up from 8 at 0.1.0). Representative cube-level nodes:
+The local `GeoExecutor` (`apps/orbit-openeo/src/geo_executor/`) implements an openEO 1.3.0 process subset. The **authoritative list** is `geo_executor/registry.rs::register_defaults` — **67 processes as of 2026-05-25** (up from 8 at 0.1.0). Representative cube-level nodes:
 
 | Process | openEO spec ID | Status |
 |---|---|---|
@@ -62,7 +62,7 @@ Unknown processes reject via the `ProcessRegistry` with an `UnknownProcess` erro
 This list is exhaustive for change-control purposes. **Each line is a hard stop for PR review.**
 
 - ❌ Will not pursue or claim openEO API conformance certification.
-- ❌ Will not implement openEO processes outside §2 without owner sign-off. (The §2 set was expanded **8 → 69 on 2026-05-25**, strictly against the openEO 1.3.0 spec; the former `docs/plans` change-control tracker was retired with the `docs/` tree, so additions are now governed by §2 + this contract directly.)
+- ❌ Will not implement openEO processes outside §2 without owner sign-off. (The §2 set was expanded **8 → 67 on 2026-05-25**, strictly against the openEO 1.3.0 spec; the former `docs/plans` change-control tracker was retired with the `docs/` tree, so additions are now governed by §2 + this contract directly.)
 - ❌ Will not track openEO spec revisions automatically. Spec is pinned to 1.3.0; future revisions are opt-in only.
 - ❌ Will not add user/billing/quota systems beyond per-user job ownership.
 - ❌ Will not host other tenants' compute (no multi-tenant deployment).
@@ -80,7 +80,7 @@ This list is exhaustive for change-control purposes. **Each line is a hard stop 
 
 To change anything in §4 WILL NOT:
 
-1. Open a PR against [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../13-geo-satellite/04-openeo-strategic-analysis.md) §4.5.3 explaining the new scope and revised maintenance commitment from §4.5.4.
+1. Open a PR against [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../../13-geo-satellite/04-openeo-strategic-analysis.md) §4.5.3 explaining the new scope and revised maintenance commitment from §4.5.4.
 2. Get explicit owner approval (`@NU` — solo-dev project, no CODEOWNERS).
 3. Land the strategic-doc change **before** the implementation PR.
 4. The implementation PR must link back to the §4.5.3 commit by SHA.
@@ -122,7 +122,7 @@ Per `04-openeo-strategic-analysis.md` §4.5.4:
 - Estimated marginal cost vs Approach C: **+1 dev-day per week** of active development.
 - Cost is dominated by integration tests against the backend HTTP surface and JSON-Schema drift.
 - Security patches for `axum`, `tonic`, `reqwest`, `sqlx`, `jsonschema` are now in the runtime surface — they are no longer optional.
-- Rust 1.85+ MSRV (`workspace.package.rust-version = "1.85"`) must be maintained.
+- Rust 1.88+ MSRV (`workspace.package.rust-version = "1.88"`) must be maintained.
 - openEO 1.3.0 fixtures must remain green; spec-pin discipline is non-negotiable.
 
 If the marginal cost trends above 2 dev-days/week sustained for 4 weeks, **the backend should be paused** and Approach C (client-only) reconsidered. This is not a hypothetical — it's the bus-factor mitigation §4.5.2 promised.
@@ -143,8 +143,8 @@ If openEO 1.3.0 is sunset by the upstream community or this project loses dev ca
 
 ## 9. Cross-References
 
-- Strategic basis: [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../13-geo-satellite/04-openeo-strategic-analysis.md) §4.5
+- Strategic basis: [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../../13-geo-satellite/04-openeo-strategic-analysis.md) §4.5
 - Live runbook + deferred work: [`CLAUDE.md`](../../CLAUDE.md) (build/run/perf; §9 STAC-client consolidation)
-- Client-adapter retrospective: [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../13-geo-satellite/04-openeo-strategic-analysis.md) §8
+- Client-adapter retrospective: [`13-geo-satellite/04-openeo-strategic-analysis.md`](../../../../13-geo-satellite/04-openeo-strategic-analysis.md) §8
 - openEO spec: <https://openeo.org/documentation/1.0/developers/api/reference.html> (pinned to 1.3.0)
 - License hygiene: [`NOTICE.md`](../../NOTICE.md), [`THIRD_PARTY.md`](../../THIRD_PARTY.md)

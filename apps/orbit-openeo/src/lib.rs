@@ -71,8 +71,13 @@ pub fn build_router(state: AppState) -> axum::Router {
         .merge(routes::services::router())
         .merge(routes::validation::router())
         .merge(routes::subscription::router())
-        .merge(routes::spec::router())
-        .merge(routes::products::router());
+        .merge(routes::spec::router());
+
+    // `/products` is geo-only (re-exports orbit_geo). Merge it just for
+    // geo-kernel builds; the shadow `let` disappears under
+    // `--no-default-features`. (audit B1, 2026-06-03)
+    #[cfg(feature = "geo-kernel")]
+    let api = api.merge(routes::products::router());
 
     Router::new()
         .merge(api)

@@ -24,7 +24,7 @@ Non-loopback addresses **require** an auth token (`--auth-token` / `ORBIT_OPENEO
 
 - openEO 1.3.0 endpoints under `routes/`
 - Spec-source-of-truth: [`spec/openapi.json`](./spec/openapi.json) — JSON-Schema-validated at request time
-- Process executor: `ProcessRegistry` handler dispatch (`src/geo_executor/registry.rs`) over `eo-process` + `orbit-geo` — **69 processes** (see `registry.rs::register_defaults`)
+- Process executor: `ProcessRegistry` handler dispatch (`src/geo_executor/registry.rs`) over `eo-process` + `orbit-geo` — **67 processes** (see `registry.rs::register_defaults`)
 - Job persistence: `SqliteJobStore` (+ orphan recovery on startup; `ORBIT_JOB_TIMEOUT_SECS`)
 
 ## What this backend will NOT do
