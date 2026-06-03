@@ -88,6 +88,8 @@ tracing-subscriber   = { workspace = true }
 # Misc.
 clap                 = { workspace = true }
 once_cell            = { workspace = true }
+# Job ids are RFC-4122 v4 UUIDs (see job_store.rs).
+uuid                 = { workspace = true }
 
 [dev-dependencies]
 tokio                = { workspace = true, features = ["full", "test-util"] }

@@ -9,11 +9,11 @@
 //! client expects).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -194,11 +194,10 @@ pub trait JobStore: Send + Sync {
     async fn recover_orphans(&self) -> Result<usize, JobError>;
 }
 
-/// In-memory store backed by a `Mutex<Vec<JobRecord>>` and an atomic counter.
+/// In-memory store backed by a `Mutex<Vec<JobRecord>>`. Job ids are v4 UUIDs.
 #[derive(Debug, Default)]
 pub struct InMemoryJobStore {
     inner: Mutex<Vec<JobRecord>>,
-    counter: AtomicU64,
 }
 
 impl InMemoryJobStore {
@@ -223,11 +222,13 @@ impl JobStore for InMemoryJobStore {
         description: Option<String>,
         process: Value,
     ) -> Result<JobRecord, JobError> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        // Deterministic-but-unique-per-call id. We deliberately don't
-        // expose epoch seconds in the id so two jobs created in the same
-        // second don't collide.
-        let id = format!("job-{n:08x}");
+        // Job ids are RFC-4122 v4 UUIDs: globally unique, opaque, and
+        // collision-free without a shared counter (so concurrent creators and
+        // process restarts never clash). Surfaced verbatim in the
+        // `openeo-identifier` header / `Location` and used as the result-asset
+        // directory name (UUIDs are filesystem-path-safe — see
+        // file_store::validate_path).
+        let id = Uuid::new_v4().to_string();
         let now = Self::now();
         let rec = JobRecord {
             id: id.clone(),
@@ -345,7 +346,6 @@ impl JobStore for InMemoryJobStore {
 /// | status     | progress | created | updated | assets JSON
 pub struct SqliteJobStore {
     pool: sqlx::SqlitePool,
-    counter: AtomicU64,
 }
 
 impl std::fmt::Debug for SqliteJobStore {
@@ -397,17 +397,9 @@ impl SqliteJobStore {
             .execute(&pool)
             .await
             .map_err(|e| JobError::Backend(format!("index: {e}")))?;
-        // Seed counter from max id suffix so restarts don't collide.
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM jobs ORDER BY created DESC LIMIT 1")
-                .fetch_optional(&pool)
-                .await
-                .map_err(|e| JobError::Backend(format!("seed: {e}")))?;
-        let start = row
-            .and_then(|(id,)| u64::from_str_radix(id.trim_start_matches("job-"), 16).ok())
-            .map(|n| n + 1)
-            .unwrap_or(0);
-        Ok(Self { pool, counter: AtomicU64::new(start) })
+        // Job ids are v4 UUIDs (globally unique) so there's no counter to
+        // seed from existing rows on restart — UUIDs never collide.
+        Ok(Self { pool })
     }
 
     fn now() -> u64 {
@@ -453,8 +445,7 @@ impl JobStore for SqliteJobStore {
         description: Option<String>,
         process: Value,
     ) -> Result<JobRecord, JobError> {
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        let id = format!("job-{n:08x}");
+        let id = Uuid::new_v4().to_string();
         let now = Self::now() as i64;
         let process_json = serde_json::to_string(&process)
             .map_err(|e| JobError::Backend(format!("encode process: {e}")))?;
@@ -645,7 +636,9 @@ mod tests {
         let a = s.create("alice", None, None, graph()).await.unwrap();
         let b = s.create("alice", None, None, graph()).await.unwrap();
         assert_ne!(a.id, b.id);
-        assert!(a.id.starts_with("job-"));
+        // Job ids are v4 UUIDs.
+        assert!(Uuid::parse_str(&a.id).is_ok(), "job id must be a UUID, got {}", a.id);
+        assert_eq!(Uuid::parse_str(&a.id).unwrap().get_version_num(), 4);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -943,7 +936,8 @@ mod tests {
         let got = s2.get(&saved_id).await.unwrap();
         assert_eq!(got.title.as_deref(), Some("persist"));
         assert_eq!(got.status, JobStatus::Finished);
-        // Counter should resume past the persisted id.
+        // A freshly-created job gets a new v4 UUID, distinct from the
+        // persisted one (UUIDs never collide across restarts).
         let next = s2.create("alice", None, None, graph()).await.unwrap();
         assert_ne!(next.id, saved_id);
         let _ = std::fs::remove_dir_all(&dir);
