@@ -337,8 +337,13 @@ impl GeoExecutor {
                             let mut vals: Vec<f32> = mask
                                 .iter()
                                 .zip(raster.iter())
-                                .filter(|(&m, &v)| m == 1 && v.is_finite() && v != SENTINEL_NDVI_NA)
-                                .map(|(_, &v)| v)
+                                .filter_map(|(&m, &v)| {
+                                    if m == 1 && v.is_finite() && v != SENTINEL_NDVI_NA {
+                                        Some(v)
+                                    } else {
+                                        None
+                                    }
+                                })
                                 .collect();
                             if vals.is_empty() {
                                 Value::Null
