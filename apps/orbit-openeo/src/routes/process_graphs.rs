@@ -21,7 +21,10 @@ pub fn router() -> Router<AppState> {
 }
 
 async fn list() -> Json<Value> {
-    Json(json!({ "processes": [], "links": [] }))
+    // openEO `GET /process_graphs` returns user-defined process graphs under
+    // the `process_graphs` key (NOT `processes` — that's `GET /processes`).
+    // UDP storage is not implemented (BACKEND-SCOPE), so the list is empty.
+    Json(json!({ "process_graphs": [], "links": [] }))
 }
 
 async fn create(Json(_pg): Json<Value>) -> StatusCode {

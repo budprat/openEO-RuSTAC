@@ -10,6 +10,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(capabilities))
         .route("/.well-known/openeo", get(well_known))
+        // openEO/STAC-API required: the capabilities `conformance` link points
+        // here. Was advertised but unmounted (404) before this fix.
+        .route("/conformance", get(conformance))
         .route("/me", get(me))
         // audit-fix (2026-06-03): unauthenticated liveness/readiness probe for
         // container orchestrators (k8s). Not part of the openEO spec, so it is
@@ -54,6 +57,9 @@ async fn capabilities(
         "title": "orbit-rs openEO",
         "description": "orbit-rs openEO 1.3.0 façade",
         "production": false,
+        // openEO 1.1+/STAC-API: advertise the conformance classes inline in
+        // the capabilities document (mirrors GET /conformance).
+        "conformsTo": conformance_classes(),
         "endpoints": endpoint_list(),
         "links": [
             { "rel": "self",          "href": "/", "type": "application/json" },
@@ -88,6 +94,27 @@ async fn well_known(
     }))
 }
 
+/// `GET /conformance` — the conformance classes this backend claims, per
+/// the openEO API + STAC API. Required: the capabilities `conformance` link
+/// resolves here. We claim only the classes the implemented surface actually
+/// satisfies (core + collections); we deliberately do NOT claim certification.
+async fn conformance() -> Json<Value> {
+    Json(json!({ "conformsTo": conformance_classes() }))
+}
+
+/// Conformance-class URIs shared by `GET /` and `GET /conformance`.
+fn conformance_classes() -> Vec<&'static str> {
+    vec![
+        // General openEO API conformance class (per the bundled
+        // spec/openapi.json, openEO 1.3.0). `conformsTo` in GET / and
+        // GET /conformance MUST be equal — both call this fn.
+        "https://api.openeo.org/1.3.0",
+        // STAC API classes backing /collections.
+        "https://api.stacspec.org/v1.0.0/core",
+        "https://api.stacspec.org/v1.0.0/collections",
+    ]
+}
+
 /// `GET /me` — user info for the currently-authenticated principal.
 async fn me() -> Json<Value> {
     Json(json!({
@@ -100,10 +127,15 @@ async fn me() -> Json<Value> {
 /// routes we actually serve.
 fn endpoint_list() -> Vec<Value> {
     [
+        // audit-fix (2026-06-03): the advertised set now mirrors the routes
+        // actually mounted. Added /conformance, /file_formats, /jobs/{id}/logs;
+        // corrected the OIDC token path; dropped the unmounted GET
+        // /credentials/oidc discovery endpoint.
         ("/", &["GET"][..]),
         ("/.well-known/openeo", &["GET"]),
+        ("/conformance", &["GET"]),
         ("/credentials/basic", &["GET"]),
-        ("/credentials/oidc", &["GET"]),
+        ("/credentials/oidc/token", &["POST"]),
         ("/me", &["GET"]),
         ("/collections", &["GET"]),
         ("/collections/{collection_id}", &["GET"]),
@@ -114,12 +146,14 @@ fn endpoint_list() -> Vec<Value> {
         ("/jobs/{job_id}", &["GET", "PATCH", "DELETE"]),
         ("/jobs/{job_id}/results", &["GET", "POST", "DELETE"]),
         ("/jobs/{job_id}/estimate", &["GET"]),
+        ("/jobs/{job_id}/logs", &["GET"]),
         ("/result", &["POST"]),
         ("/files/{user_id}", &["GET"]),
         ("/files/{user_id}/{path}", &["GET", "PUT", "DELETE"]),
         ("/services", &["GET", "POST"]),
         ("/services/{service_id}", &["GET", "PATCH", "DELETE"]),
         ("/service_types", &["GET"]),
+        ("/file_formats", &["GET"]),
         ("/output_formats", &["GET"]),
         ("/udf_runtimes", &["GET"]),
         ("/validation", &["POST"]),
@@ -204,6 +238,23 @@ mod tests {
         assert_eq!(v["api_version"], "1.3.0");
         assert_eq!(v["id"], "orbit-rs");
         assert!(v["endpoints"].as_array().unwrap().len() >= 20);
+        // Capabilities advertises conformance classes inline.
+        let conforms = v["conformsTo"].as_array().expect("conformsTo array");
+        assert!(conforms.iter().any(|c| c == "https://api.openeo.org/1.3.0"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_conformance_returns_conforms_to_and_matches_capabilities() {
+        let resp = app()
+            .oneshot(axum::http::Request::builder().uri("/conformance").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let v = body_to_json(resp).await;
+        let classes = v["conformsTo"].as_array().expect("conformsTo array");
+        // Spec: GET / and GET /conformance MUST list equal classes.
+        assert_eq!(classes, &super::conformance_classes().into_iter()
+            .map(serde_json::Value::from).collect::<Vec<_>>());
+        assert!(classes.iter().any(|c| c == "https://api.openeo.org/1.3.0"));
     }
 
     #[tokio::test(flavor = "current_thread")]

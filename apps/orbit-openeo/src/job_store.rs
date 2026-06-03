@@ -107,7 +107,7 @@ impl JobRecord {
     }
 }
 
-fn iso8601(unix_secs: u64) -> String {
+pub(crate) fn iso8601(unix_secs: u64) -> String {
     // Minimal ISO-8601 without dragging in chrono. openEO clients accept
     // "1970-01-01T00:00:00Z"-shaped strings — we emit the same.
     let secs = unix_secs as i64;
