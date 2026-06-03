@@ -65,6 +65,14 @@ const MAX_ARRAY_LEN: usize = 10_000_000;
 pub fn array_create(args: &std::collections::BTreeMap<String, Value>) -> Result<Value, ExecError> {
     let data = args.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     let repeat = args.get("repeat").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+    // Empty input ⇒ empty result regardless of `repeat`. Return early so the
+    // loop below cannot spin `repeat` times: with `data.len()==0` the length
+    // product is `0·repeat == 0`, which would otherwise pass the cap and let a
+    // huge `repeat` busy-loop (cap-defeat DoS). With `data` non-empty and
+    // `total ≤ MAX_ARRAY_LEN`, `repeat ≤ total ≤ MAX_ARRAY_LEN` — loop bounded.
+    if data.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
     let total = usize::try_from(repeat)
         .ok()
         .and_then(|r| data.len().checked_mul(r))
@@ -241,6 +249,12 @@ mod tests {
         // boundary: exactly at the cap is allowed, one over is not.
         assert!(array_create(&m(json!({"data": [0], "repeat": 10_000_000u64}))).is_ok());
         assert!(array_create(&m(json!({"data": [0], "repeat": 10_000_001u64}))).is_err());
+        // cap-defeat guard: empty data + huge repeat must NOT busy-loop —
+        // returns an empty array immediately (the length cap is 0 here).
+        assert_eq!(
+            array_create(&m(json!({"data": [], "repeat": 100_000_000_000u64}))).unwrap(),
+            json!([])
+        );
     }
 
     #[test]
