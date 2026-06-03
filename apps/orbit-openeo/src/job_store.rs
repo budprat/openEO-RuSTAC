@@ -63,6 +63,20 @@ pub struct JobAsset {
     pub size: u64,
 }
 
+/// openEO log entry (`GET /jobs/{id}/logs`). `level` is one of
+/// `debug`/`info`/`warning`/`error`; `time` is RFC3339.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobLogEntry {
+    /// Stable per-entry id (monotonic index as a string).
+    pub id: String,
+    /// Log level: debug | info | warning | error.
+    pub level: String,
+    /// Human-readable message.
+    pub message: String,
+    /// RFC3339 timestamp.
+    pub time: String,
+}
+
 /// One persisted job. The openEO "Detailed Job" extends this — vendor
 /// extras stored under `extra` for round-trip.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -183,6 +197,15 @@ pub trait JobStore: Send + Sync {
     /// in [`crate::file_store::FileStore`]; this stores only metadata.
     async fn add_asset(&self, id: &str, asset: JobAsset) -> Result<(), JobError>;
 
+    /// Append a log entry for a job (powers `GET /jobs/{id}/logs`). The
+    /// `id`/`time` fields of the entry are assigned by the implementation;
+    /// callers pass the `level` + `message`. No-op error `NotFound` if absent.
+    async fn append_log(&self, id: &str, level: &str, message: &str) -> Result<(), JobError>;
+
+    /// Fetch a job's log entries in insertion order. Errors `NotFound` for an
+    /// absent job; returns an empty vec for a job with no logs.
+    async fn get_logs(&self, id: &str) -> Result<Vec<JobLogEntry>, JobError>;
+
     /// **Orphan recovery (2026-05-25, ported from JonaAI
     /// `jobs.py` startup recovery)**: transition every job stuck in a
     /// non-terminal state (`Queued` or `Running`) to `Error`. Called once
@@ -198,6 +221,8 @@ pub trait JobStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct InMemoryJobStore {
     inner: Mutex<Vec<JobRecord>>,
+    /// Per-job log entries (job id → entries in insertion order).
+    logs: Mutex<std::collections::HashMap<String, Vec<JobLogEntry>>>,
 }
 
 impl InMemoryJobStore {
@@ -306,6 +331,7 @@ impl JobStore for InMemoryJobStore {
     async fn delete(&self, id: &str) -> Result<(), JobError> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.retain(|r| r.id != id);
+        self.logs.lock().unwrap_or_else(|p| p.into_inner()).remove(id);
         Ok(())
     }
 
@@ -318,6 +344,42 @@ impl JobStore for InMemoryJobStore {
         rec.assets.push(asset);
         rec.updated = Self::now();
         Ok(())
+    }
+
+    async fn append_log(&self, id: &str, level: &str, message: &str) -> Result<(), JobError> {
+        // Require the job to exist.
+        {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if !g.iter().any(|r| r.id == id) {
+                return Err(JobError::NotFound(id.into()));
+            }
+        }
+        let mut logs = self.logs.lock().unwrap_or_else(|p| p.into_inner());
+        let entries = logs.entry(id.to_string()).or_default();
+        let entry = JobLogEntry {
+            id: entries.len().to_string(),
+            level: level.to_string(),
+            message: message.to_string(),
+            time: iso8601(Self::now()),
+        };
+        entries.push(entry);
+        Ok(())
+    }
+
+    async fn get_logs(&self, id: &str) -> Result<Vec<JobLogEntry>, JobError> {
+        {
+            let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if !g.iter().any(|r| r.id == id) {
+                return Err(JobError::NotFound(id.into()));
+            }
+        }
+        Ok(self
+            .logs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn recover_orphans(&self) -> Result<usize, JobError> {
@@ -387,12 +449,25 @@ impl SqliteJobStore {
                 progress    REAL,
                 created     INTEGER NOT NULL,
                 updated     INTEGER NOT NULL,
-                assets      TEXT NOT NULL DEFAULT '[]'
+                assets      TEXT NOT NULL DEFAULT '[]',
+                logs        TEXT NOT NULL DEFAULT '[]'
             )"#,
         )
         .execute(&pool)
         .await
         .map_err(|e| JobError::Backend(format!("migrate: {e}")))?;
+        // Idempotent migration for DBs created before the `logs` column
+        // existed. SQLite errors if the column is already present — ignore
+        // exactly that case so reopening a current DB is a no-op.
+        if let Err(e) = sqlx::query("ALTER TABLE jobs ADD COLUMN logs TEXT NOT NULL DEFAULT '[]'")
+            .execute(&pool)
+            .await
+        {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                return Err(JobError::Backend(format!("migrate logs column: {msg}")));
+            }
+        }
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id)")
             .execute(&pool)
             .await
@@ -600,6 +675,47 @@ impl JobStore for SqliteJobStore {
             .map_err(|e| JobError::Backend(format!("update: {e}")))?;
         tx.commit().await.map_err(|e| JobError::Backend(format!("commit: {e}")))?;
         Ok(())
+    }
+
+    async fn append_log(&self, id: &str, level: &str, message: &str) -> Result<(), JobError> {
+        // Transactional read-modify-write, mirroring add_asset.
+        let mut tx = self.pool.begin().await
+            .map_err(|e| JobError::Backend(format!("tx: {e}")))?;
+        let row: Option<(String,)> = sqlx::query_as("SELECT logs FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| JobError::Backend(format!("select logs: {e}")))?;
+        let (logs_json,) = row.ok_or_else(|| JobError::NotFound(id.into()))?;
+        let mut logs: Vec<JobLogEntry> = serde_json::from_str(&logs_json)
+            .map_err(|e| JobError::Backend(format!("decode logs: {e}")))?;
+        logs.push(JobLogEntry {
+            id: logs.len().to_string(),
+            level: level.to_string(),
+            message: message.to_string(),
+            time: iso8601(Self::now()),
+        });
+        let logs_json = serde_json::to_string(&logs)
+            .map_err(|e| JobError::Backend(format!("encode logs: {e}")))?;
+        sqlx::query("UPDATE jobs SET logs = ? WHERE id = ?")
+            .bind(&logs_json)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| JobError::Backend(format!("update logs: {e}")))?;
+        tx.commit().await.map_err(|e| JobError::Backend(format!("commit: {e}")))?;
+        Ok(())
+    }
+
+    async fn get_logs(&self, id: &str) -> Result<Vec<JobLogEntry>, JobError> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT logs FROM jobs WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| JobError::Backend(format!("select logs: {e}")))?;
+        let (logs_json,) = row.ok_or_else(|| JobError::NotFound(id.into()))?;
+        serde_json::from_str(&logs_json)
+            .map_err(|e| JobError::Backend(format!("decode logs: {e}")))
     }
 
     async fn recover_orphans(&self) -> Result<usize, JobError> {

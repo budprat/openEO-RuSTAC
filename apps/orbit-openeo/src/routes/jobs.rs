@@ -57,8 +57,12 @@ async fn job_logs(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.jobs.get(&job_id).await {
-        Ok(_) => (StatusCode::OK, Json(json!({ "logs": [], "links": [] }))).into_response(),
+    match state.jobs.get_logs(&job_id).await {
+        Ok(logs) => (
+            StatusCode::OK,
+            Json(json!({ "logs": logs, "links": [] })),
+        )
+            .into_response(),
         Err(JobError::NotFound(_)) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "code": "JobNotFound", "message": format!("job '{job_id}' not found") })),
@@ -249,13 +253,44 @@ async fn delete_job(
     }
 }
 
-async fn estimate_job(Path(_job_id): Path<String>) -> Json<Value> {
-    Json(json!({
-        "costs": 0,
-        "duration": "PT0S",
-        "size": 0,
-        "downloads_included": 0
-    }))
+/// `GET /jobs/{job_id}/estimate` — best-effort cost/duration/size estimate.
+/// This reference backend has no billing model, so `costs` is always 0; but
+/// the estimate is now **job-aware**: it 404s for unknown jobs (the stub
+/// ignored the id) and, once a job has finished, reports the real output
+/// `size` (sum of asset bytes) and `duration` (ISO-8601 from created→updated).
+async fn estimate_job(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let rec = match state.jobs.get(&job_id).await {
+        Ok(r) => r,
+        Err(JobError::NotFound(_)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "code": "JobNotFound", "message": format!("job '{job_id}' not found") })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "code": "Internal", "message": e.to_string() })),
+            )
+                .into_response()
+        }
+    };
+    let size: u64 = rec.assets.iter().map(|a| a.size).sum();
+    let secs = rec.updated.saturating_sub(rec.created);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "costs": 0,
+            "duration": format!("PT{secs}S"),
+            "size": size,
+            "downloads_included": 0,
+        })),
+    )
+        .into_response()
 }
 
 async fn start_processing(
@@ -941,6 +976,43 @@ mod tests {
             .oneshot(axum::http::Request::builder().uri("/jobs/does-not-exist/logs").body(Body::empty()).unwrap())
             .await.unwrap();
         assert_eq!(resp.status(), 404);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_logs_capture_lifecycle_after_run() {
+        // After a job runs to completion the store holds spec-shaped log
+        // entries (id/level/message/time) — "job started" + "job finished".
+        let state = AppStateBuilder::new().build();
+        let app = Router::new().merge(router()).with_state(state.clone());
+        let created = app.clone()
+            .oneshot(
+                axum::http::Request::builder().method("POST").uri("/jobs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"process":{"process_graph":{"a":{"process_id":"add","arguments":{"x":1,"y":2},"result":true}}}}"#))
+                    .unwrap(),
+            ).await.unwrap();
+        let id = created.headers().get("openeo-identifier").unwrap().to_str().unwrap().to_string();
+        let _ = app.clone()
+            .oneshot(axum::http::Request::builder().method("POST").uri(format!("/jobs/{id}/results")).body(Body::empty()).unwrap())
+            .await.unwrap();
+        let mut done = false;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if state.jobs.get(&id).await.unwrap().status == JobStatus::Finished { done = true; break; }
+        }
+        assert!(done, "job never finished");
+        let resp = app
+            .oneshot(axum::http::Request::builder().uri(format!("/jobs/{id}/logs")).body(Body::empty()).unwrap())
+            .await.unwrap();
+        let v = body_to_json(resp).await;
+        let logs = v["logs"].as_array().expect("logs array");
+        assert!(!logs.is_empty(), "finished job must have captured logs");
+        let messages: Vec<&str> = logs.iter().filter_map(|l| l["message"].as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("started")), "got {messages:?}");
+        assert!(messages.iter().any(|m| m.contains("finished")), "got {messages:?}");
+        // Each entry is spec-shaped.
+        assert!(logs[0].get("id").is_some() && logs[0].get("level").is_some()
+            && logs[0].get("time").is_some());
     }
 
     /// E4 — GET /jobs/{id}/results/{asset_name} streams the bytes.

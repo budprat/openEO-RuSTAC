@@ -73,6 +73,9 @@ pub async fn run_job(
     if let Err(e) = store.set_status(job_id, JobStatus::Running).await {
         return RunOutcome::StoreError(e.to_string());
     }
+    // Capture lifecycle log entries for `GET /jobs/{id}/logs` (best-effort —
+    // a log-write failure must never fail the job).
+    let _ = store.append_log(job_id, "info", "job started").await;
     let _ = store.set_progress(job_id, 10.0).await;
     bus.publish(JobEvent {
         user_id: user_id.to_string(),
@@ -107,6 +110,9 @@ pub async fn run_job(
                 job_id = %job_id, timeout_secs,
                 "job exceeded ORBIT_JOB_TIMEOUT_SECS — marking error"
             );
+            let _ = store
+                .append_log(job_id, "error", &format!("job timed out after {timeout_secs}s"))
+                .await;
             let _ = store.set_status(job_id, JobStatus::Error).await;
             bus.publish(JobEvent {
                 user_id: user_id.to_string(),
@@ -174,6 +180,7 @@ pub async fn run_job(
             if let Err(e) = store.set_status(job_id, JobStatus::Finished).await {
                 return RunOutcome::StoreError(e.to_string());
             }
+            let _ = store.append_log(job_id, "info", "job finished").await;
             let _ = store.set_progress(job_id, 100.0).await;
             bus.publish(JobEvent {
                 user_id: user_id.to_string(),
@@ -187,6 +194,7 @@ pub async fn run_job(
             // Map the execution error into a status + event.
             let detail = format_exec_error(&e);
             tracing::error!(job_id = %job_id, error = %detail, "executor failed");
+            let _ = store.append_log(job_id, "error", &format!("executor failed: {detail}")).await;
             let _ = store.set_status(job_id, JobStatus::Error).await;
             bus.publish(JobEvent {
                 user_id: user_id.to_string(),
