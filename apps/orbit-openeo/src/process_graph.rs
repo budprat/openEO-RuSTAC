@@ -205,13 +205,18 @@ where
     Ok(())
 }
 
-/// **M4 (process audit)** — collect every `process_id` referenced anywhere
-/// in a raw process-graph JSON value, INCLUDING those nested inside
-/// sub-callback `process_graph`s (`reducer` / `process` / `overlap_resolver`
-/// / `mask`). Unlike the topological walker, callback ids ARE collected here
-/// because an unknown process in a callback is just as unsupported as one at
-/// the top level — we want to reject it at submit/validate time, not only
-/// when the runner reaches it.
+/// **M4 (process audit)** — collect the `process_id` of every TOP-LEVEL node
+/// in a process graph. Mirrors the **P0-3** namespace-isolation rule of the
+/// topological walker: recursion short-circuits at `process_graph` keys, so
+/// processes used only inside sub-callbacks (`reducer` / `process` /
+/// `overlap_resolver` / `mask`) are NOT collected here.
+///
+/// Why: the `ProcessRegistry` is the TOP-LEVEL dispatch table. Callback
+/// sub-graphs are validated at run time by the owning process (`apply` /
+/// `reduce_dimension` / `merge_cubes`), and they legitimately support
+/// callback-only processes (`min` / `max` / `linear_scale_range` / `mean` …)
+/// that are not top-level registry entries. Collecting those here would make
+/// submit-time validation reject perfectly valid graphs.
 ///
 /// Accepts either the full submission body (`{"process": {"process_graph":
 /// …}}`), the `{"process_graph": …}` wrapper, or a bare node map.
@@ -224,6 +229,12 @@ pub fn collect_process_ids(body: &Value) -> std::collections::BTreeSet<String> {
             Value::Object(map) => {
                 if let Some(Value::String(pid)) = map.get("process_id") {
                     out.insert(pid.clone());
+                }
+                // P0-3: do not descend into sub-callback graphs — their
+                // `process_id`s live in an inner namespace validated at run
+                // time, and may be callback-only processes not in the registry.
+                if map.contains_key("process_graph") {
+                    return;
                 }
                 for inner in map.values() {
                     walk(inner, depth + 1, out);
@@ -573,8 +584,10 @@ mod tests {
     // ---------- M4: process-id collection + unsupported detection ----------
 
     #[test]
-    fn collect_process_ids_includes_callback_processes() {
-        // Top-level reduce_dimension + an inner `mean` reducer callback.
+    fn collect_process_ids_excludes_callback_processes() {
+        // P0-3: top-level reduce_dimension is collected; the inner `mean`
+        // reducer callback (an inner-namespace, possibly callback-only
+        // process) is NOT — it is validated at run time by reduce_dimension.
         let body = serde_json::json!({
             "process": { "process_graph": {
                 "load": { "process_id": "load_collection", "arguments": {} },
@@ -589,7 +602,7 @@ mod tests {
         let ids = collect_process_ids(&body);
         assert!(ids.contains("load_collection"));
         assert!(ids.contains("reduce_dimension"));
-        assert!(ids.contains("mean"), "callback process ids must be collected");
+        assert!(!ids.contains("mean"), "callback process ids must NOT leak to top-level validation");
     }
 
     #[test]

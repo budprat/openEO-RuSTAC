@@ -43,9 +43,11 @@ async fn validate(
 
     // 2. **M4 (process audit)**: schema validation alone never catches a
     // graph that references an UNIMPLEMENTED process — it would validate
-    // clean and only fail at run time. Cross-check every referenced
-    // process id (including sub-callbacks) against the implemented set so
-    // `openeo.validate()` surfaces the problem before submission.
+    // clean and only fail at run time. Cross-check every TOP-LEVEL process
+    // id against the implemented set so `openeo.validate()` surfaces the
+    // problem before submission. (Callback sub-graphs are validated at run
+    // time by their owning process and may use callback-only processes — see
+    // `collect_process_ids` P0-3 short-circuit.)
     let known = crate::process_catalog::process_ids();
     for bad in crate::process_graph::unsupported_process_ids(&body, &known) {
         errors.push(json!({
